@@ -10,10 +10,10 @@ The system is implemented on a **Raspberry Pi 400** controlling image processing
 
 The goal of the system is to:
 
-• Track the interface position with sub-pixel accuracy
-• Estimate growth velocity in real time
-• Move the stage smoothly to keep the interface centered
-• Record synchronized experimental data
+- Track the interface position with sub-pixel accuracy
+- Estimate growth velocity in real time
+- Move the stage smoothly to keep the interface centered
+- Record synchronized experimental data
 
 ---
 
@@ -36,13 +36,13 @@ Camera → Image Processing → Interface Position → Kalman Filter → Stage C
 
 ## 3.1 Image Acquisition
 
-Images are captured every ( \Delta t = 2,s ).
+Images are captured every ( $\Delta t = 2 s$ ).
 
 Each frame is represented as an intensity matrix:
 
-[
+$$
 I(x,y)
-]
+$$
 
 where:
 
@@ -57,24 +57,23 @@ The interface appears as a strong intensity gradient because two phases have dif
 
 To detect the interface, a Sobel operator is applied in the vertical direction.
 
-[
+$$
 G_y(x,y) =
 \begin{bmatrix}
--1 & -2 & -1 \
-0 & 0 & 0 \
+-1 & -2 & -1 \\
+0 & 0 & 0 \\
 1 & 2 & 1
 \end{bmatrix}
-
-* I(x,y)
-  ]
+\cdot I(x,y)
+$$
 
 where ( * ) denotes convolution.
 
 The magnitude of the gradient is:
 
-[
+$$
 |G_y(x,y)|
-]
+$$
 
 This highlights horizontal edges such as the phase boundary.
 
@@ -86,9 +85,9 @@ The interface is assumed to be approximately horizontal.
 
 Therefore the gradient is averaged across each row:
 
-[
+$$
 S(y) = \frac{1}{N_x} \sum_{x=1}^{N_x} |G_y(x,y)|
-]
+$$
 
 where:
 
@@ -97,9 +96,9 @@ where:
 
 The interface location corresponds to the maximum gradient:
 
-[
+$$
 y_0 = \arg\max_y S(y)
-]
+$$
 
 ---
 
@@ -111,29 +110,29 @@ To improve precision, a quadratic interpolation is performed around the maximum.
 
 Let:
 
-[
+$$
 g_{-1} = S(y_0-1)
-]
-[
+$$
+$$
 g_0 = S(y_0)
-]
-[
+$$
+$$
 g_{+1} = S(y_0+1)
-]
+$$
 
 The sub-pixel correction is:
 
-[
+$$
 \delta =
 \frac{g_{-1} - g_{+1}}
 {2(g_{-1} - 2g_0 + g_{+1})}
-]
+$$
 
 The refined interface position is:
 
-[
+$$
 y_{sub} = y_0 + \delta
-]
+$$
 
 Typical precision achieved:
 
@@ -143,11 +142,11 @@ Typical precision achieved:
 
 # 7. Conversion to Physical Position
 
-Pixel position is converted to millimeters using calibration.
+Pixel position is converted to millimetres using calibration.
 
-[
+$$
 h = y_{sub} \cdot c
-]
+$$
 
 where
 
@@ -155,9 +154,9 @@ where
 
 Example:
 
-[
+$$
 c = 0.02 , mm/pixel
-]
+$$
 
 ---
 
@@ -165,15 +164,15 @@ c = 0.02 , mm/pixel
 
 Image measurements contain noise.
 
-The interface dynamics are modeled using a state vector:
+The interface dynamics are modelled using a state vector:
 
-[
+$$
 x =
 \begin{bmatrix}
 h \
 v
 \end{bmatrix}
-]
+$$
 
 where
 
@@ -182,47 +181,47 @@ where
 
 State propagation:
 
-[
+$$
 x_{k+1} =
 \begin{bmatrix}
-1 & \Delta t \
+1 & \Delta t \\
 0 & 1
 \end{bmatrix}
 x_k
-]
+$$
 
 Measurement equation:
 
-[
+$$
 z_k =
 \begin{bmatrix}
 1 & 0
 \end{bmatrix}
 x_k
-]
+$$
 
 The Kalman filter performs:
 
 Prediction:
 
-[
+$$
 x^- = F x
-]
+$$
 
 Update:
 
-[
+$$
 K = P H^T (H P H^T + R)^{-1}
-]
+$$
 
-[
+$$
 x = x^- + K(z - Hx^-)
-]
+$$
 
 This produces smoothed estimates of:
 
-• interface position
-• growth velocity
+- interface position
+- growth velocity
 
 ---
 
@@ -230,15 +229,15 @@ This produces smoothed estimates of:
 
 The instantaneous growth velocity is obtained directly from the Kalman state:
 
-[
+$$
 v = \frac{dh}{dt}
-]
+$$
 
 Growth rate in mm/min:
 
-[
-v_{mm/min} = 60v
-]
+$$
+v_{mm/min} = v \cdot 60
+$$
 
 ---
 
@@ -246,19 +245,19 @@ v_{mm/min} = 60v
 
 To avoid stage oscillation, the system predicts where the interface will be at the next frame.
 
-[
+$$
 h_{future} = h + v \Delta t
-]
+$$
 
 The control error becomes:
 
-[
+$$
 e = h_{future} - h_{target}
-]
+$$
 
 where:
 
-(h_{target}) is the desired interface position in the image.
+($h_{target}$) is the desired interface position in the image.
 
 ---
 
@@ -268,9 +267,9 @@ The camera is mounted on a vertical stage driven by a stepper motor.
 
 Motor displacement is related to steps:
 
-[
+$$
 d = \frac{s}{N}
-]
+$$
 
 where
 
@@ -279,9 +278,9 @@ where
 
 Control law:
 
-[
-s = k e N
-]
+$$
+s = k \cdot e \cdot N
+$$
 
 where (k) is a gain parameter (typically 0.5).
 
@@ -299,15 +298,15 @@ The Arduino generates STEP pulses for the DRV8825 driver.
 
 Pulse frequency:
 
-[
+$$
 f = \frac{speed}{2}
-]
+$$
 
 Motor position is tracked internally:
 
-[
+$$
 p_{k+1} = p_k + s
-]
+$$
 
 ---
 
@@ -315,9 +314,9 @@ p_{k+1} = p_k + s
 
 If the gradient confidence drops below threshold:
 
-[
+$$
 \frac{S(y_0)}{\bar S} < C_{min}
-]
+$$
 
 the interface is considered lost.
 
@@ -330,9 +329,9 @@ Search motion:
 
 small step increments:
 
-[
-\pm 0.1 , mm
-]
+$$
+\pm 0.1  mm
+$$
 
 until interface reappears.
 
@@ -346,15 +345,15 @@ A PID controller regulates cooling power.
 
 Control law:
 
-[
+$$
 u(t) = K_p e + K_i \int e,dt + K_d \frac{de}{dt}
-]
+$$
 
 where
 
-[
+$$
 e = T_{set} - T
-]
+$$
 
 Output (u(t)) controls PWM duty cycle applied to the Peltier element.
 
@@ -366,13 +365,13 @@ The system logs experimental parameters every second.
 
 Logged variables include:
 
-• timestamp
-• temperature
-• interface position
-• filtered interface position
-• growth rate
-• motor position
-• PWM duty cycle
+- timestamp
+- temperature
+- interface position
+- filtered interface position
+- growth rate
+- motor position
+- PWM duty cycle
 
 Disk writes are buffered and flushed every 10 minutes to reduce SD card wear.
 
@@ -380,13 +379,11 @@ Disk writes are buffered and flushed every 10 minutes to reduce SD card wear.
 
 # 16. Visualization
 
-The system provides live feedback:
+The system provides live feedback plots of
 
-plots of
-
-• temperature
-• interface height
-• growth rate
+- temperature
+- interface height
+- growth rate
 
 as well as the camera image with the detected interface overlay.
 
@@ -410,10 +407,10 @@ The presented system combines computer vision, predictive control, and motorized
 
 Key advantages include:
 
-• sub-pixel interface detection
-• predictive stage motion
-• real-time growth analysis
-• autonomous recovery from detection loss
+- sub-pixel interface detection
+- predictive stage motion
+- real-time growth analysis
+- autonomous recovery from detection loss
 
 The architecture is suitable for long-duration experiments where accurate measurement of interface dynamics is required.
 
