@@ -1,0 +1,22 @@
+camera:
+  width: 640
+  height: 480
+  capture_interval: 2
+
+experiment:
+  target_interface_mm: 10
+  mm_per_pixel: 0.02
+  steps_per_mm: 200
+
+temperature:
+  target: -5
+  kp: 15
+  ki: 0.5
+  kd: 2
+
+logging:
+  interval: 1
+  flush_interval: 600
+
+motor:
+  serial_port: /dev/ttyACM0

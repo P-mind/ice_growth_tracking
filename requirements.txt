@@ -1,0 +1,10 @@
+numpy
+opencv-python
+matplotlib
+pandas
+pyserial
+pyyaml
+jupyter
+scipy
+seaborn
+adafruit-circuitpython-max31865
