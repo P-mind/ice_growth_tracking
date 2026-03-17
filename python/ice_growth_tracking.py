@@ -71,6 +71,10 @@ import adafruit_max31865
 
 import matplotlib.pyplot as plt
 
+import argparse
+
+import sys
+
 ########################################
 # USER CONFIGURATION
 ########################################
@@ -80,9 +84,10 @@ CAMERA_INDEX = 0
 IMAGE_WIDTH = 640
 IMAGE_HEIGHT = 480
 
-CAPTURE_INTERVAL = 2.0
+CAPTURE_INTERVAL = 1.0
 LOG_INTERVAL = 1.0
 FLUSH_INTERVAL = 600
+DISPLAY_INTERVAL = 0.5
 
 TARGET_INTERFACE_MM = 10
 INTERFACE_CONF_THRESHOLD = 2.0  # Pixel
@@ -209,7 +214,7 @@ class PIDController(threading.Thread):
 
 class InterfaceKalman:
 
-    def __init__(self,dt=2.0):
+    def __init__(self,dt=1.0):
 
         self.dt=dt
 
@@ -289,7 +294,7 @@ class InterfaceTracker(threading.Thread):
         self.motor=motor
         self.running=True
 
-        self.kalman=InterfaceKalman()
+        self.kalman=InterfaceKalman(dt=CAPTURE_INTERVAL)
 
         self.cap=cv2.VideoCapture(CAMERA_INDEX)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,IMAGE_WIDTH)
@@ -492,37 +497,84 @@ class LiveDisplay(threading.Thread):
 
                 cv2.waitKey(1)
 
-            time.sleep(1)
+            time.sleep(DISPLAY_INTERVAL)
+
+class DummyMotor:
+    def move_steps(self, steps, speed=1500):
+        pass  # No motor control
+    def get_position_mm(self):
+        return 0.0
 
 ########################################
 # MAIN
 ########################################
 
 def main():
+    parser = argparse.ArgumentParser(description="Ice Growth Tracking System")
+    parser.add_argument('--no-motor', action='store_true', help='Disable motor control')
+    parser.add_argument('--no-pid', action='store_true', help='Disable PID temperature control')
+    parser.add_argument('--no-logger', action='store_true', help='Disable logging')
+    parser.add_argument('--test-camera', action='store_true', help='Test camera and display only (disables motor, PID, logger)')
+    parser.add_argument('--capture-interval', type=float, default=1.0, help='Capture interval in seconds (default: 1.0)')
+    parser.add_argument('--display-interval', type=float, default=0.5, help='Display update interval in seconds (default: 0.5)')
+    parser.add_argument('--image-width', type=int, default=640, help='Camera image width (default: 640)')
+    parser.add_argument('--image-height', type=int, default=480, help='Camera image height (default: 480)')
+    parser.add_argument('--test-arduino', action='store_true', help='Test Arduino serial communication and exit')
 
-    motor=ArduinoStepper()
+    args = parser.parse_args()
 
-    pid=PIDController()
-    tracker=InterfaceTracker(motor)
-    logger=Logger()
-    display=LiveDisplay()
+    if args.test_arduino:
+        try:
+            stepper = ArduinoStepper()
+            # Test communication by sending a move command
+            stepper.move_steps(0, 1000)  # Move 0 steps to get position
+            print("Arduino communication successful. Current position:", stepper.get_position_mm())
+        except Exception as e:
+            print(f"Arduino communication failed: {e}")
+        sys.exit(0)
 
-    pid.start()
-    tracker.start()
-    logger.start()
-    display.start()
+    if args.test_camera:
+        args.no_motor = True
+        args.no_pid = True
+        args.no_logger = True
+
+    # Update global config
+    global CAPTURE_INTERVAL
+    CAPTURE_INTERVAL = args.capture_interval
+    global DISPLAY_INTERVAL
+    DISPLAY_INTERVAL = args.display_interval
+    global IMAGE_WIDTH
+    IMAGE_WIDTH = args.image_width
+    global IMAGE_HEIGHT
+    IMAGE_HEIGHT = args.image_height
+
+    if args.no_motor:
+        motor = DummyMotor()
+    else:
+        motor = ArduinoStepper()
+
+    tracker = InterfaceTracker(motor)
+    display = LiveDisplay()
+
+    threads = [tracker, display]
+
+    if not args.no_pid:
+        pid = PIDController()
+        threads.append(pid)
+
+    if not args.no_logger:
+        logger = Logger()
+        threads.append(logger)
+
+    for thread in threads:
+        thread.start()
 
     try:
-
         while True:
             time.sleep(1)
-
     except KeyboardInterrupt:
-
-        pid.running=False
-        tracker.running=False
-        logger.running=False
-        display.running=False
+        for thread in threads:
+            thread.running = False
 
 if __name__=="__main__":
     main()
