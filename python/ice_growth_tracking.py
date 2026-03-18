@@ -95,7 +95,7 @@ INTERFACE_CONF_THRESHOLD = 2.0  # Pixel
 MAX_TRAVEL_MM = 50      # Prevent motor from moving too far in case of tracking loss
 
 MM_PER_PIXEL = 0.02
-STEPS_PER_MM = 200
+STEPS_PER_MM = 400
 
 PID_TARGET_TEMP = -5.0
 
