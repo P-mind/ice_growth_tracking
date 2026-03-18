@@ -5,6 +5,8 @@
 #define DIR_PIN 7
 #define EN_PIN 8
 
+#define MAX_CURRENT 500 // mA (driver limit, not motor limit)
+#define MICROSTEPS 16   // 1/16 microstepping for smooth motion
 #define SERIAL_PORT Serial
 #define DRIVER_ADDRESS 0b00
 
@@ -77,9 +79,9 @@ void setup()
   driver.toff(5);
 
   // CRITICAL: tuned for Adafruit NEMA17
-  driver.rms_current(300);  // mA (safe default)
+  driver.rms_current(MAX_CURRENT);  // mA (safe default)
 
-  driver.microsteps(32);     // high precision
+  driver.microsteps(MICROSTEPS);     // smooth motion
 
   driver.en_spreadCycle(false); // stealthChop (quiet)
   driver.pwm_autoscale(true);
@@ -87,7 +89,7 @@ void setup()
   // Optional: reduce idle current (less heating)
   driver.idle_current_percent(50);
 
-  Serial.println("TMC2209 + Adafruit NEMA17 ready");
+  Serial.println("TMC2209 + Stepper motor ready");
 }
 
 // ---------------- LOOP ----------------
