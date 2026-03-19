@@ -527,7 +527,7 @@ def main():
         try:
             stepper = ArduinoStepper()
             # Test communication by sending a move command
-            stepper.move_steps(0, 1000)  # Move 0 steps to get position
+            stepper.move_steps(6000, 500)  # Move 0 steps to get position
             print("Arduino communication successful. Current position:", stepper.get_position_mm())
         except Exception as e:
             print(f"Arduino communication failed: {e}")
