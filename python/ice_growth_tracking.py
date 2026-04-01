@@ -315,6 +315,9 @@ class InterfaceTracker(threading.Thread):
             if not ret:
                 continue
 
+            # Rotate camera frame 180 degrees for correct orientation
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
+
             row,confidence = detect_interface(frame)
 
             if row is None or confidence < INTERFACE_CONF_THRESHOLD:
