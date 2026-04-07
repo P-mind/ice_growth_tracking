@@ -84,7 +84,7 @@ CAMERA_INDEX = 0
 IMAGE_WIDTH = 640
 IMAGE_HEIGHT = 480
 
-CAPTURE_INTERVAL = 1.0
+CAPTURE_INTERVAL = 0.5 #1.0
 LOG_INTERVAL = 1.0
 FLUSH_INTERVAL = 600
 DISPLAY_INTERVAL = 0.5
@@ -156,26 +156,16 @@ class ArduinoStepper:
             return self.position_steps/STEPS_PER_MM
 
 ########################################
-# PID CONTROLLER
+# TEMPERATURE READER
 ########################################
 
-class PIDController(threading.Thread):
+class TemperatureReader(threading.Thread):
 
     def __init__(self):
 
         super().__init__()
 
         self.running=True
-
-        self.Kp=15
-        self.Ki=0.5
-        self.Kd=2
-
-        self.integral=0
-        self.prev_error=0
-
-        pwm_pin = board.D18
-        self.pwm = pwmio.PWMOut(pwm_pin, frequency=20000)
 
         spi = busio.SPI(board.SCK, board.MOSI, board.MISO)
         cs = digitalio.DigitalInOut(board.D5)
@@ -188,23 +178,9 @@ class PIDController(threading.Thread):
 
             temp = self.sensor.temperature
 
-            error = PID_TARGET_TEMP-temp
-
-            self.integral += error
-            derivative = error-self.prev_error
-
-            output = self.Kp*error + self.Ki*self.integral + self.Kd*derivative
-
-            duty = max(0,min(65535,int(output)))
-
-            self.pwm.duty_cycle = duty
-
             with state.lock:
 
                 state.temperature = temp
-                state.pwm_duty = duty/65535
-
-            self.prev_error = error
 
             time.sleep(1)
 
@@ -280,6 +256,79 @@ def detect_interface(frame):
         sub=idx + 0.5*(g1-g3)/denom
 
     return sub,confidence
+
+########################################
+# DUAL INTERFACE DETECTION
+########################################
+
+def detect_upper_interface(frame, min_distance=20, height_threshold=0.3):
+    """
+    Detect the upper interface when two interfaces are present.
+    
+    Finds all local peaks in the vertical gradient profile and returns
+    the uppermost (topmost) peak with highest confidence.
+    
+    Args:
+        frame: Input image frame
+        min_distance: Minimum pixel distance between peaks (default: 20)
+        height_threshold: Minimum height relative to mean to be considered a peak (default: 0.3)
+    
+    Returns:
+        tuple: (upper_interface_pixels, confidence) or (None, 0) if detection fails
+    """
+    
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5,5), 0)
+    
+    sobel = cv2.Sobel(blur, cv2.CV_64F, 0, 1, ksize=3)
+    gradient = np.abs(sobel)
+    
+    row_strength = gradient.mean(axis=1)
+    
+    mean_strength = np.mean(row_strength)
+    
+    # Find local maxima (peaks)
+    peaks = []
+    for i in range(1, len(row_strength) - 1):
+        if (row_strength[i] > row_strength[i-1] and 
+            row_strength[i] > row_strength[i+1] and
+            row_strength[i] > mean_strength * height_threshold):
+            peaks.append((i, row_strength[i]))
+    
+    if len(peaks) == 0:
+        return None, 0
+    
+    # Filter peaks by minimum distance
+    filtered_peaks = []
+    for idx, strength in peaks:
+        if not filtered_peaks or (idx - filtered_peaks[-1][0]) >= min_distance:
+            filtered_peaks.append((idx, strength))
+    
+    # Calculate confidence for each peak
+    peak_data = []
+    for idx, strength in filtered_peaks:
+        confidence = strength / (mean_strength + 1e-6)
+        
+        # Subpixel refinement
+        if idx > 0 and idx < len(row_strength) - 1:
+            g1 = row_strength[idx - 1]
+            g2 = row_strength[idx]
+            g3 = row_strength[idx + 1]
+            denom = (g1 - 2*g2 + g3)
+            
+            if abs(denom) < 1e-6:
+                sub = idx
+            else:
+                sub = idx + 0.5 * (g1 - g3) / denom
+        else:
+            sub = idx
+        
+        peak_data.append((sub, confidence))
+    
+    # Return the uppermost (topmost) peak
+    upper_interface = min(peak_data, key=lambda x: x[0])
+    
+    return upper_interface[0], upper_interface[1]
 
 ########################################
 # INTERFACE TRACKING
@@ -515,9 +564,8 @@ class DummyMotor:
 def main():
     parser = argparse.ArgumentParser(description="Ice Growth Tracking System")
     parser.add_argument('--no-motor', action='store_true', help='Disable motor control')
-    parser.add_argument('--no-pid', action='store_true', help='Disable PID temperature control')
     parser.add_argument('--no-logger', action='store_true', help='Disable logging')
-    parser.add_argument('--test-camera', action='store_true', help='Test camera and display only (disables motor, PID, logger)')
+    parser.add_argument('--test-camera', action='store_true', help='Test camera and display only (disables motor, logger)')
     parser.add_argument('--capture-interval', type=float, default=1.0, help='Capture interval in seconds (default: 1.0)')
     parser.add_argument('--display-interval', type=float, default=0.5, help='Display update interval in seconds (default: 0.5)')
     parser.add_argument('--image-width', type=int, default=640, help='Camera image width (default: 640)')
@@ -561,9 +609,9 @@ def main():
 
     threads = [tracker, display]
 
-    if not args.no_pid:
-        pid = PIDController()
-        threads.append(pid)
+    # Always read temperature
+    temp_reader = TemperatureReader()
+    threads.append(temp_reader)
 
     if not args.no_logger:
         logger = Logger()
