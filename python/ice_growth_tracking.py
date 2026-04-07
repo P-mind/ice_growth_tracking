@@ -108,7 +108,19 @@ SERIAL_PORT = "/dev/ttyACM0"
 class SystemState:
 
     def __init__(self):
+        """
+        Initializes the SystemState class, which holds global state variables for the system.
 
+        Attributes:
+            lock (threading.Lock): Lock for thread-safe access to state variables.
+            temperature (float or None): Current temperature reading in Celsius.
+            interface_mm (float or None): Raw detected interface position in millimeters.
+            interface_filtered (float or None): Kalman-filtered interface position in millimeters.
+            growth_rate (float or None): Estimated growth rate in mm/min.
+            motor_position_mm (float): Current motor position in millimeters (default: 0).
+            pwm_duty (float): Current PWM duty cycle for cooling (default: 0).
+            image (numpy.ndarray or None): Current camera frame.
+        """
         self.lock = threading.Lock()
 
         self.temperature = None
@@ -129,7 +141,14 @@ state = SystemState()
 class ArduinoStepper:
 
     def __init__(self):
+        """
+        Initializes the ArduinoStepper class for controlling a stepper motor via serial communication with an Arduino.
 
+        Attributes:
+            ser (serial.Serial): Serial connection to the Arduino.
+            position_steps (int): Current motor position in steps.
+            lock (threading.Lock): Lock for thread-safe access to position.
+        """
         self.ser = serial.Serial(SERIAL_PORT,115200,timeout=2)
         time.sleep(2)
 
@@ -137,7 +156,13 @@ class ArduinoStepper:
         self.lock = threading.Lock()
 
     def move_steps(self,steps,speed=1500):
+        """
+        Moves the stepper motor by a specified number of steps at a given speed.
 
+        Args:
+            steps (int): Number of steps to move (positive for one direction, negative for the other).
+            speed (int, optional): Speed of movement in steps per second (default: 1500).
+        """
         cmd=f"MOVE {steps} {speed}\n"
         self.ser.write(cmd.encode())
 
@@ -151,7 +176,12 @@ class ArduinoStepper:
                 self.position_steps=pos
 
     def get_position_mm(self):
+        """
+        Retrieves the current motor position in millimeters.
 
+        Returns:
+            float: Current position in millimeters.
+        """
         with self.lock:
             return self.position_steps/STEPS_PER_MM
 
@@ -162,7 +192,13 @@ class ArduinoStepper:
 class TemperatureReader(threading.Thread):
 
     def __init__(self):
+        """
+        Initializes the TemperatureReader class, a threading class that continuously reads temperature from a MAX31865 sensor.
 
+        Attributes:
+            running (bool): Flag to control the thread execution.
+            sensor (adafruit_max31865.MAX31865): Temperature sensor instance.
+        """
         super().__init__()
 
         self.running=True
@@ -173,7 +209,9 @@ class TemperatureReader(threading.Thread):
         self.sensor = adafruit_max31865.MAX31865(spi,cs)
 
     def run(self):
-
+        """
+        Runs the temperature reading loop, updating the global state with temperature readings every second.
+        """
         while self.running:
 
             temp = self.sensor.temperature
@@ -191,7 +229,21 @@ class TemperatureReader(threading.Thread):
 class InterfaceKalman:
 
     def __init__(self,dt=1.0):
+        """
+        Initializes the InterfaceKalman class, implementing a Kalman filter for smoothing and predicting interface position.
 
+        Args:
+            dt (float, optional): Time step for the filter (default: 1.0).
+
+        Attributes:
+            dt (float): Time step.
+            x (numpy.ndarray): State vector [position, velocity].
+            F (numpy.ndarray): State transition matrix.
+            H (numpy.ndarray): Measurement matrix.
+            P (numpy.ndarray): Covariance matrix.
+            Q (numpy.ndarray): Process noise covariance.
+            R (numpy.ndarray): Measurement noise covariance.
+        """
         self.dt=dt
 
         self.x=np.array([[0.0],[0.0]])
@@ -205,7 +257,15 @@ class InterfaceKalman:
         self.R=np.array([[0.5]])
 
     def update(self,measurement):
+        """
+        Updates the Kalman filter with a new measurement and returns the filtered state.
 
+        Args:
+            measurement (float): New interface position measurement.
+
+        Returns:
+            numpy.ndarray: Filtered state vector [position, velocity].
+        """
         z=np.array([[measurement]])
 
         self.x=self.F@self.x
@@ -225,7 +285,18 @@ class InterfaceKalman:
 ########################################
 
 def detect_interface(frame):
+    """
+    Detects the ice-water interface in a camera frame by converting to grayscale, applying Gaussian blur, 
+    computing vertical gradients with Sobel operator, and finding the row with the strongest gradient.
 
+    Args:
+        frame: Input camera frame (BGR image).
+
+    Returns:
+        tuple: (interface_position_pixels, confidence) where interface_position_pixels is the subpixel-accurate 
+               position in pixels, or None if detection fails, and confidence is a score based on peak strength 
+               relative to mean gradient.
+    """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray,(5,5),0)
 
@@ -337,7 +408,21 @@ def detect_upper_interface(frame, min_distance=20, height_threshold=0.3):
 class InterfaceTracker(threading.Thread):
 
     def __init__(self,motor):
+        """
+        Initializes the InterfaceTracker class, a threading class that tracks the interface using camera and motor.
 
+        Args:
+            motor: Motor control object (e.g., ArduinoStepper or DummyMotor).
+
+        Attributes:
+            motor: Motor control instance.
+            running (bool): Flag to control thread execution.
+            kalman (InterfaceKalman): Kalman filter for interface smoothing.
+            cap (cv2.VideoCapture): Camera capture object.
+            lost_counter (int): Counter for consecutive interface detection failures.
+            search_direction (int): Direction for search mode (1 or -1).
+            search_step (int): Step size for search mode in steps.
+        """
         super().__init__()
 
         self.motor=motor
@@ -356,7 +441,10 @@ class InterfaceTracker(threading.Thread):
 
 
     def run(self):
-
+        """
+        Runs the interface tracking loop, capturing frames, detecting interface, applying Kalman filter, 
+        and controlling motor to keep interface at target position. Includes recovery modes for lost interface.
+        """
         while self.running:
 
             ret,frame=self.cap.read()
@@ -435,7 +523,15 @@ class InterfaceTracker(threading.Thread):
 class Logger(threading.Thread):
 
     def __init__(self):
+        """
+        Initializes the Logger class, a threading class that logs experimental data to a CSV file.
 
+        Attributes:
+            running (bool): Flag to control thread execution.
+            file (file object): Open CSV file for writing.
+            writer (csv.writer): CSV writer object.
+            last_flush (float): Timestamp of last file flush.
+        """
         super().__init__()
 
         self.running=True
@@ -458,7 +554,9 @@ class Logger(threading.Thread):
         self.last_flush=time.time()
 
     def run(self):
-
+        """
+        Runs the logging loop, writing data rows to CSV at regular intervals and flushing periodically.
+        """
         while self.running:
 
             time.sleep(LOG_INTERVAL)
@@ -491,7 +589,17 @@ class Logger(threading.Thread):
 class LiveDisplay(threading.Thread):
 
     def __init__(self):
+        """
+        Initializes the LiveDisplay class, a threading class that provides real-time visualization of the experiment.
 
+        Attributes:
+            running (bool): Flag to control thread execution.
+            temp_hist (collections.deque): History of temperature readings.
+            interface_hist (collections.deque): History of interface positions.
+            growth_hist (collections.deque): History of growth rates.
+            fig (matplotlib.figure.Figure): Matplotlib figure for plotting.
+            ax (matplotlib.axes.Axes): Matplotlib axes for plotting.
+        """
         super().__init__()
 
         self.running=True
@@ -505,7 +613,10 @@ class LiveDisplay(threading.Thread):
         self.fig,self.ax=plt.subplots()
 
     def run(self):
-
+        """
+        Runs the display loop, updating live plots of temperature, interface, and growth rate, 
+        and showing annotated camera frames with detected interface.
+        """
         while self.running:
 
             with state.lock:
@@ -552,9 +663,25 @@ class LiveDisplay(threading.Thread):
             time.sleep(DISPLAY_INTERVAL)
 
 class DummyMotor:
+    """
+    A mock motor class for testing purposes when hardware is not available.
+    """
     def move_steps(self, steps, speed=1500):
+        """
+        No-op method for moving steps (does nothing).
+
+        Args:
+            steps (int): Number of steps (ignored).
+            speed (int, optional): Speed (ignored).
+        """
         pass  # No motor control
     def get_position_mm(self):
+        """
+        Returns a dummy position of 0.0 mm.
+
+        Returns:
+            float: Always 0.0.
+        """
         return 0.0
 
 ########################################
@@ -562,6 +689,11 @@ class DummyMotor:
 ########################################
 
 def main():
+    """
+    The entry point of the program. Parses command-line arguments for configuration options, initializes hardware components 
+    (motor, temperature sensor), starts background threads for tracking, logging, display, and temperature reading. 
+    Runs an infinite loop until interrupted, then gracefully stops all threads.
+    """
     parser = argparse.ArgumentParser(description="Ice Growth Tracking System")
     parser.add_argument('--no-motor', action='store_true', help='Disable motor control')
     parser.add_argument('--no-logger', action='store_true', help='Disable logging')
