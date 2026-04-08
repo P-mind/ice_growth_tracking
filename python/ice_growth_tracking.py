@@ -100,6 +100,8 @@ STEPS_PER_MM = 400
 PID_TARGET_TEMP = -5.0
 
 SERIAL_PORT = "/dev/ttyACM0"
+TEMP_SENSOR_CS_PINS = [board.D5, board.D6, board.D12, board.D13]
+NUM_TEMP_SENSORS = len(TEMP_SENSOR_CS_PINS)
 
 ########################################
 # GLOBAL STATE
@@ -124,6 +126,7 @@ class SystemState:
         self.lock = threading.Lock()
 
         self.temperature = None
+        self.temperatures = [None] * NUM_TEMP_SENSORS
         self.interface_mm = None
         self.interface_filtered = None
         self.growth_rate = None
@@ -204,9 +207,8 @@ class TemperatureReader(threading.Thread):
         self.running=True
 
         spi = busio.SPI(board.SCK, board.MOSI, board.MISO)
-        cs = digitalio.DigitalInOut(board.D5)
-
-        self.sensor = adafruit_max31865.MAX31865(spi,cs)
+        self.cs_pins = [digitalio.DigitalInOut(pin) for pin in TEMP_SENSOR_CS_PINS]
+        self.sensors = [adafruit_max31865.MAX31865(spi, cs) for cs in self.cs_pins]
 
     def run(self):
         """
@@ -214,11 +216,13 @@ class TemperatureReader(threading.Thread):
         """
         while self.running:
 
-            temp = self.sensor.temperature
+            temps = [sensor.temperature for sensor in self.sensors]
+            valid_temps = [t for t in temps if t is not None]
+            avg_temp = np.mean(valid_temps) if valid_temps else None
 
             with state.lock:
-
-                state.temperature = temp
+                state.temperatures = temps
+                state.temperature = avg_temp
 
             time.sleep(1)
 
@@ -543,12 +547,15 @@ class Logger(threading.Thread):
 
             self.writer.writerow([
                 "timestamp",
-                "temperature_C",
+                "temperature_1_C",
+                "temperature_2_C",
+                "temperature_3_C",
+                "temperature_4_C",
+                "temperature_avg_C",
                 "interface_mm",
                 "filtered_interface_mm",
                 "growth_rate_mm_min",
-                "motor_position_mm",
-                "pwm_duty"
+                "motor_position_mm"
             ])
 
         self.last_flush=time.time()
@@ -565,12 +572,12 @@ class Logger(threading.Thread):
 
                 row=[
                     datetime.now().isoformat(),
+                    *state.temperatures,
                     state.temperature,
                     state.interface_mm,
                     state.interface_filtered,
                     state.growth_rate,
-                    state.motor_position_mm,
-                    state.pwm_duty
+                    state.motor_position_mm
                 ]
 
             self.writer.writerow(row)
@@ -718,7 +725,6 @@ def main():
 
     if args.test_camera:
         args.no_motor = True
-        args.no_pid = True
         args.no_logger = True
 
     # Update global config
