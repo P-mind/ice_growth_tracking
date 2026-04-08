@@ -112,7 +112,8 @@ CSV_HEADER = [
                 "interface_mm",
                 "filtered_interface_mm",
                 "growth_rate_mm_min",
-                "motor_position_mm"
+                "motor_position_mm",
+                "motor_status"
             ]
 
 ########################################
@@ -143,6 +144,7 @@ class SystemState:
         self.growth_rate = None
         self.motor_position_mm = 0
         self.pwm_duty = 0
+        self.motor_status = "running"  # "running", "stopped_wall", "searching"
 
         self.image = None
 
@@ -219,6 +221,15 @@ class ArduinoStepper:
         line=self.ser.readline().decode().strip()
         if not line.startswith("STOP2 OK"):
             raise RuntimeError(f"Failed to stop motor2: {line}")
+
+    def reset_system(self):
+        """
+        Resets the system state (can be used to clear motor stopped flags).
+        """
+        self.ser.write(b"RESET\n")
+        line=self.ser.readline().decode().strip()
+        if not line.startswith("RESET OK"):
+            raise RuntimeError(f"Failed to reset system: {line}")
 
     def get_position_mm(self):
         """
@@ -450,12 +461,13 @@ def detect_upper_interface(frame, min_distance=20, height_threshold=0.3):
 
 class InterfaceTracker(threading.Thread):
 
-    def __init__(self,motor):
+    def __init__(self,motor, reset_motor=False):
         """
         Initializes the InterfaceTracker class, a threading class that tracks the interface using camera and motor.
 
         Args:
             motor: Motor control object (e.g., ArduinoStepper or DummyMotor).
+            reset_motor (bool): Whether to reset motor stopped state on startup.
 
         Attributes:
             motor: Motor control instance.
@@ -465,6 +477,7 @@ class InterfaceTracker(threading.Thread):
             lost_counter (int): Counter for consecutive interface detection failures.
             search_direction (int): Direction for search mode (1 or -1).
             search_step (int): Step size for search mode in steps.
+            motor_stopped (bool): Flag to track if motor is stopped due to hitting wall.
         """
         super().__init__()
 
@@ -481,6 +494,10 @@ class InterfaceTracker(threading.Thread):
         self.lost_counter = 0
         self.search_direction = 1
         self.search_step = int(STEPS_PER_MM * 0.1)
+        self.motor_stopped = False  # Flag to track if motor is stopped due to hitting wall
+        
+        if reset_motor:
+            self.motor_stopped = False
 
 
     def run(self):
@@ -504,6 +521,10 @@ class InterfaceTracker(threading.Thread):
                 self.lost_counter += 1
             else:
                 self.lost_counter = 0
+                # Reset motor stopped state when interface is found
+                if self.motor_stopped:
+                    print("Interface found - resetting motor stopped state")
+                    self.motor_stopped = False
 
             # Normal Tracking Mode
             if self.lost_counter == 0:
@@ -512,7 +533,7 @@ class InterfaceTracker(threading.Thread):
                 future = height + velocity * CAPTURE_INTERVAL
                 error = future - TARGET_INTERFACE_MM
                 steps = int(error * STEPS_PER_MM * 0.5)
-                if abs(error) > 0.02:
+                if abs(error) > 0.02 and not self.motor_stopped:
                     self.motor.move_steps(steps)
             # Short Loss (Prediction Hold)
             elif self.lost_counter < 3:
@@ -521,36 +542,35 @@ class InterfaceTracker(threading.Thread):
                 predicted = height + velocity * CAPTURE_INTERVAL
                 error = predicted - TARGET_INTERFACE_MM
                 steps = int(error * STEPS_PER_MM * 0.3)
-                self.motor.move_steps(steps)
+                if not self.motor_stopped:
+                    self.motor.move_steps(steps)
             # Long Loss (Search Mode)
             else:
                 print("Interface lost — searching")
                 interface_mm = 0
                 height, velocity = 0, 0
-                self.motor.move_steps(self.search_direction * self.search_step)
-                if self.lost_counter % 20 == 0:
-                    self.search_direction *= -1
+                if not self.motor_stopped:
+                    self.motor.move_steps(self.search_direction * self.search_step)
+                    if self.lost_counter % 20 == 0:
+                        self.search_direction *= -1
             
-            # Prevent stage runaway
+            # Check for wall hits and stop motor
             motor_pos = self.motor.get_position_mm()
-            if abs(motor_pos) > MAX_TRAVEL_MM:
-                print("Prevent stage runaway")
-                # Move back towards center
-                if motor_pos > 0:
-                    self.motor.move_steps(-20)  # Move up
-                else:
-                    self.motor.move_steps(20)   # Move down
+            if abs(motor_pos) >= MAX_TRAVEL_MM:
+                if not self.motor_stopped:
+                    print(f"Motor hit wall at position {motor_pos:.2f} mm - stopping motor")
+                    self.motor_stopped = True
+            elif self.motor_stopped and abs(motor_pos) < MAX_TRAVEL_MM - 5:  # Allow some hysteresis
+                print(f"Motor moved away from wall - resuming operation")
+                self.motor_stopped = False
 
-            # row=detect_interface(frame)
-            # interface_mm=row*MM_PER_PIXEL
-            # height,velocity=self.kalman.update(interface_mm)
-            # future=height+velocity*CAPTURE_INTERVAL
-            # error=future-TARGET_INTERFACE_MM
-            # steps=int(error*STEPS_PER_MM*0.5)
-            # if abs(error)>0.02:
-            #     self.motor.move_steps(-steps)
-
-            # motor_pos=self.motor.get_position_mm()
+            # Update motor status
+            if self.motor_stopped:
+                motor_status = "stopped_wall"
+            elif self.lost_counter >= 3:
+                motor_status = "searching"
+            else:
+                motor_status = "running"
 
             with state.lock:
 
@@ -558,6 +578,7 @@ class InterfaceTracker(threading.Thread):
                 state.interface_filtered=height
                 state.growth_rate=velocity*60
                 state.motor_position_mm=motor_pos
+                state.motor_status=motor_status
                 state.image=frame
 
             time.sleep(CAPTURE_INTERVAL)
@@ -609,7 +630,8 @@ class Logger(threading.Thread):
                     state.interface_mm,
                     state.interface_filtered,
                     state.growth_rate,
-                    state.motor_position_mm
+                    state.motor_position_mm,
+                    state.motor_status
                 ]
 
             self.writer.writerow(row)
@@ -719,7 +741,7 @@ def main():
     parser.add_argument('--image-width', type=int, default=640, help='Camera image width (default: 640)')
     parser.add_argument('--image-height', type=int, default=480, help='Camera image height (default: 480)')
     parser.add_argument('--motor2-rpm', type=int, default=120, help='RPM for the secondary motor')
-    parser.add_argument('--test-arduino', action='store_true', help='Test Arduino serial communication and exit')
+    parser.add_argument('--reset-motor', action='store_true', help='Reset motor stopped state on startup')
 
     args = parser.parse_args()
 
@@ -772,7 +794,7 @@ def main():
         motor.set_rpm(args.motor2_rpm)
         motor.start_motor2()
 
-    tracker = InterfaceTracker(motor)
+    tracker = InterfaceTracker(motor, reset_motor=args.reset_motor)
     display = LiveDisplay()
 
     threads = [display, tracker]

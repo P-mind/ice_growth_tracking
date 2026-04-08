@@ -181,6 +181,11 @@ void loop()
       Serial.println("STOP2 OK");
     }
 
+    else if(cmd.startsWith("RESET"))
+    {
+      Serial.println("RESET OK");
+    }
+
     else if(cmd.startsWith("ZERO"))
     {
       position_steps = 0;
