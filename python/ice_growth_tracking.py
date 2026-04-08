@@ -86,7 +86,7 @@ IMAGE_HEIGHT = 480
 
 CAPTURE_INTERVAL = 0.5 #1.0
 LOG_INTERVAL = 1.0
-FLUSH_INTERVAL = 600
+FLUSH_INTERVAL = 20
 DISPLAY_INTERVAL = 0.5
 
 TARGET_INTERFACE_MM = 10
@@ -96,8 +96,6 @@ MAX_TRAVEL_MM = 80      # Prevent motor from moving too far in case of tracking 
 
 MM_PER_PIXEL = 0.02
 STEPS_PER_MM = 400
-
-PID_TARGET_TEMP = -5.0
 
 SERIAL_PORT = "/dev/ttyACM0"
 TEMP_SENSOR_CS_PINS = [board.D5, board.D6, board.D12, board.D13]
@@ -551,7 +549,7 @@ class Logger(threading.Thread):
         self.running=True
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.filename = f"experiment_log_{timestamp}.csv"
+        self.filename = f"./data/experiment_log_{timestamp}.csv"
         self.file=open(self.filename,"a",newline="")
         self.writer=csv.writer(self.file)
 
@@ -702,7 +700,7 @@ def main():
 
     if args.test_camera:
         args.no_motor = True
-        args.no_logger = True
+        args.no_logger = False
 
     if args.test_temperature:
         temp_reader = TemperatureReader()
