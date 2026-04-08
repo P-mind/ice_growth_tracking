@@ -705,6 +705,7 @@ def main():
     parser.add_argument('--no-motor', action='store_true', help='Disable motor control')
     parser.add_argument('--no-logger', action='store_true', help='Disable logging')
     parser.add_argument('--test-camera', action='store_true', help='Test camera and display only (disables motor, logger)')
+    parser.add_argument('--test-temperature', action='store_true', help='Test temperature sensors only and print readings')
     parser.add_argument('--capture-interval', type=float, default=1.0, help='Capture interval in seconds (default: 1.0)')
     parser.add_argument('--display-interval', type=float, default=0.5, help='Display update interval in seconds (default: 0.5)')
     parser.add_argument('--image-width', type=int, default=640, help='Camera image width (default: 640)')
@@ -726,6 +727,26 @@ def main():
     if args.test_camera:
         args.no_motor = True
         args.no_logger = True
+
+    if args.test_temperature:
+        temp_reader = TemperatureReader()
+        temp_reader.start()
+        try:
+            while True:
+                with state.lock:
+                    temps = state.temperatures.copy()
+                    avg_temp = state.temperature
+                formatted = ", ".join(
+                    f"T{i+1}={t:.2f}C" if t is not None else f"T{i+1}=None"
+                    for i, t in enumerate(temps)
+                )
+                avg_text = f"avg={avg_temp:.2f}C" if avg_temp is not None else "avg=None"
+                print(f"{formatted}, {avg_text}")
+                time.sleep(1)
+        except KeyboardInterrupt:
+            temp_reader.running = False
+            temp_reader.join()
+        sys.exit(0)
 
     # Update global config
     global CAPTURE_INTERVAL
