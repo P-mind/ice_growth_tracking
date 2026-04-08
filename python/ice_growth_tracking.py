@@ -189,6 +189,28 @@ class ArduinoStepper:
             with self.lock:
                 self.position_steps=pos
 
+    def set_rpm(self, rpm):
+        """
+        Sets the RPM for the secondary motor via Arduino serial.
+
+        Args:
+            rpm (int): Desired RPM for the second motor.
+        """
+        cmd=f"SETRPM {rpm}\n"
+        self.ser.write(cmd.encode())
+        line=self.ser.readline().decode().strip()
+        if not line.startswith("RPM OK"):
+            raise RuntimeError(f"Failed to set RPM: {line}")
+
+    def start_motor2(self):
+        """
+        Starts the secondary motor after RPM has been configured.
+        """
+        self.ser.write(b"START2\n")
+        line=self.ser.readline().decode().strip()
+        if not line.startswith("START2 OK"):
+            raise RuntimeError(f"Failed to start motor2: {line}")
+
     def get_position_mm(self):
         """
         Retrieves the current motor position in millimeters.
@@ -684,6 +706,7 @@ def main():
     parser.add_argument('--display-interval', type=float, default=0.5, help='Display update interval in seconds (default: 0.5)')
     parser.add_argument('--image-width', type=int, default=640, help='Camera image width (default: 640)')
     parser.add_argument('--image-height', type=int, default=480, help='Camera image height (default: 480)')
+    parser.add_argument('--motor2-rpm', type=int, default=120, help='RPM for the secondary motor')
     parser.add_argument('--test-arduino', action='store_true', help='Test Arduino serial communication and exit')
 
     args = parser.parse_args()
@@ -734,6 +757,8 @@ def main():
         motor = DummyMotor()
     else:
         motor = ArduinoStepper()
+        motor.set_rpm(args.motor2_rpm)
+        motor.start_motor2()
 
     tracker = InterfaceTracker(motor)
     display = LiveDisplay()

@@ -9,8 +9,10 @@
 long position_steps = 0;
 long position_steps2 = 0;
 
-// Timer2 interrupt variables for motor 2 at 60 RPM (200 steps/sec)
+// Motor 2 timer state and RPM control
 volatile int step_pin_state2 = LOW;
+float motor2_rpm = 0.0;
+bool motor2_enabled = false;
 
 float accel = 2000.0;   // steps/s²
 int max_speed = 2000;   // steps/s
@@ -50,8 +52,52 @@ void moveSteps(long steps, int speed)
   Serial.println(position_steps);
 }
 
-// Timer2 ISR - drives motor 2 at 60 RPM (200 steps/sec)
-// Timer2 fires at 400 Hz, toggling step pin to create 200 complete pulses/sec
+void setMotor2Rpm(int rpm)
+{
+  if(rpm < 0) rpm = 0;
+
+  motor2_rpm = rpm;
+
+  if(rpm == 0)
+  {
+    TIMSK2 &= ~_BV(OCIE2A);
+    return;
+  }
+
+  float pulses_per_sec = rpm * 200.0 / 60.0 * 2.0;
+  float ocr = 16000000.0 / (8.0 * pulses_per_sec) - 1.0;
+
+  if(ocr < 0.0)
+    ocr = 0.0;
+  if(ocr > 255.0)
+    ocr = 255.0;
+
+  OCR2A = (uint8_t)(ocr + 0.5);
+
+  if(motor2_enabled)
+  {
+    TIMSK2 |= _BV(OCIE2A);
+  }
+}
+
+void startMotor2()
+{
+  if(motor2_rpm <= 0.0)
+    return;
+
+  motor2_enabled = true;
+  TCCR2B = _BV(CS21);  // Timer2 prescaler 8
+  TIMSK2 |= _BV(OCIE2A);
+}
+
+void stopMotor2()
+{
+  motor2_enabled = false;
+  TIMSK2 &= ~_BV(OCIE2A);
+  TCCR2B = 0;
+}
+
+// Timer2 ISR - drives motor 2 via set RPM
 ISR(TIMER2_COMPA_vect)
 {
   step_pin_state2 = !step_pin_state2;
@@ -81,14 +127,10 @@ void setup()
 
   Serial.begin(115200);
   
-  // Configure Timer2 for 400 Hz interrupt (drives motor 2 at 60 RPM = 200 steps/sec)
-  // Timer2 is 8-bit, so with prescaler 64 and compare value 62:
-  // Frequency = 16,000,000 / (64 * (62 + 1)) = 16,000,000 / 4,032 ≈ 3,968 Hz
-  // Adjust to approximately 400 Hz for 200 pulses/sec at double toggle
-  TCCR2A = 0x02;  // CTC mode
-  TCCR2B = 0x04;  // Prescaler 64
-  OCR2A = 62;     // Compare value
-  TIMSK2 = 0x02;  // Enable compare interrupt
+  // Configure Timer2 in CTC mode, but do not enable it until the Python script starts motor 2.
+  TCCR2A = _BV(WGM21);  // CTC mode
+  TCCR2B = 0;           // Timer stopped until START2 command
+  TIMSK2 = 0;           // No interrupt yet
 }
 
 void loop()
@@ -117,6 +159,26 @@ void loop()
     {
       Serial.print("POS2 ");
       Serial.println(position_steps2);
+    }
+
+    else if(cmd.startsWith("SETRPM"))
+    {
+      int rpm = 0;
+      sscanf(cmd.c_str(),"SETRPM %d",&rpm);
+      setMotor2Rpm(rpm);
+      Serial.println("RPM OK");
+    }
+
+    else if(cmd.startsWith("START2"))
+    {
+      startMotor2();
+      Serial.println("START2 OK");
+    }
+
+    else if(cmd.startsWith("STOP2"))
+    {
+      stopMotor2();
+      Serial.println("STOP2 OK");
     }
 
     else if(cmd.startsWith("ZERO"))
