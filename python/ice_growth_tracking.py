@@ -92,7 +92,7 @@ DISPLAY_INTERVAL = 0.5
 TARGET_INTERFACE_MM = 10
 INTERFACE_CONF_THRESHOLD = 2.0  # Pixel
 
-MAX_TRAVEL_MM = 50      # Prevent motor from moving too far in case of tracking loss
+MAX_TRAVEL_MM = 80      # Prevent motor from moving too far in case of tracking loss
 
 MM_PER_PIXEL = 0.02
 STEPS_PER_MM = 400
@@ -102,6 +102,20 @@ PID_TARGET_TEMP = -5.0
 SERIAL_PORT = "/dev/ttyACM0"
 TEMP_SENSOR_CS_PINS = [board.D5, board.D6, board.D12, board.D13]
 NUM_TEMP_SENSORS = len(TEMP_SENSOR_CS_PINS)
+
+MAX_LENGTH_DISPLAY = 100000
+
+CSV_HEADER = [
+                "timestamp",
+                "temperature_peltier_C",
+                "temperature_top_out_C",
+                "temperature_bottom_middle_C",
+                "temperature_bottom_out_C",
+                "interface_mm",
+                "filtered_interface_mm",
+                "growth_rate_mm_min",
+                "motor_position_mm"
+            ]
 
 ########################################
 # GLOBAL STATE
@@ -115,7 +129,7 @@ class SystemState:
 
         Attributes:
             lock (threading.Lock): Lock for thread-safe access to state variables.
-            temperature (float or None): Current temperature reading in Celsius.
+            temperatures (list): List of current temperature readings in Celsius (one per sensor).
             interface_mm (float or None): Raw detected interface position in millimeters.
             interface_filtered (float or None): Kalman-filtered interface position in millimeters.
             growth_rate (float or None): Estimated growth rate in mm/min.
@@ -125,7 +139,6 @@ class SystemState:
         """
         self.lock = threading.Lock()
 
-        self.temperature = None
         self.temperatures = [None] * NUM_TEMP_SENSORS
         self.interface_mm = None
         self.interface_filtered = None
@@ -217,12 +230,9 @@ class TemperatureReader(threading.Thread):
         while self.running:
 
             temps = [sensor.temperature for sensor in self.sensors]
-            valid_temps = [t for t in temps if t is not None]
-            avg_temp = np.mean(valid_temps) if valid_temps else None
 
             with state.lock:
                 state.temperatures = temps
-                state.temperature = avg_temp
 
             time.sleep(1)
 
@@ -540,23 +550,14 @@ class Logger(threading.Thread):
 
         self.running=True
 
-        self.file=open("experiment_log.csv","a",newline="")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.filename = f"experiment_log_{timestamp}.csv"
+        self.file=open(self.filename,"a",newline="")
         self.writer=csv.writer(self.file)
 
-        if os.stat("experiment_log.csv").st_size==0:
+        if os.stat(self.filename).st_size==0:
 
-            self.writer.writerow([
-                "timestamp",
-                "temperature_1_C",
-                "temperature_2_C",
-                "temperature_3_C",
-                "temperature_4_C",
-                "temperature_avg_C",
-                "interface_mm",
-                "filtered_interface_mm",
-                "growth_rate_mm_min",
-                "motor_position_mm"
-            ])
+            self.writer.writerow(CSV_HEADER)
 
         self.last_flush=time.time()
 
@@ -573,7 +574,6 @@ class Logger(threading.Thread):
                 row=[
                     datetime.now().isoformat(),
                     *state.temperatures,
-                    state.temperature,
                     state.interface_mm,
                     state.interface_filtered,
                     state.growth_rate,
@@ -601,71 +601,47 @@ class LiveDisplay(threading.Thread):
 
         Attributes:
             running (bool): Flag to control thread execution.
-            temp_hist (collections.deque): History of temperature readings.
+            temp1_hist, temp2_hist, temp3_hist, temp4_hist (collections.deque): Histories of individual temperature readings.
             interface_hist (collections.deque): History of interface positions.
             growth_hist (collections.deque): History of growth rates.
-            fig (matplotlib.figure.Figure): Matplotlib figure for plotting.
-            ax (matplotlib.axes.Axes): Matplotlib axes for plotting.
+            new_data (threading.Event): Event to signal when new data is available for display.
         """
         super().__init__()
 
         self.running=True
 
-        self.temp_hist=deque(maxlen=1000)
-        self.interface_hist=deque(maxlen=1000)
-        self.growth_hist=deque(maxlen=1000)
+        self.temp1_hist=deque(maxlen=MAX_LENGTH_DISPLAY)
+        self.temp2_hist=deque(maxlen=MAX_LENGTH_DISPLAY)
+        self.temp3_hist=deque(maxlen=MAX_LENGTH_DISPLAY)
+        self.temp4_hist=deque(maxlen=MAX_LENGTH_DISPLAY)
+        self.interface_hist=deque(maxlen=MAX_LENGTH_DISPLAY)
+        self.growth_hist=deque(maxlen=MAX_LENGTH_DISPLAY)
 
-        plt.ion()
-
-        self.fig,self.ax=plt.subplots()
+        self.new_data = threading.Event()
 
     def run(self):
         """
-        Runs the display loop, updating live plots of temperature, interface, and growth rate, 
-        and showing annotated camera frames with detected interface.
+        Runs the display loop, collecting data and signaling when new data is available for display.
         """
         while self.running:
 
             with state.lock:
 
-                t=state.temperature
+                temps=state.temperatures
                 i=state.interface_filtered
                 g=state.growth_rate
                 img=state.image
 
-            if t is not None:
+            if any(t is not None for t in temps):
 
-                self.temp_hist.append(t)
+                if len(temps) >= 1 and temps[0] is not None: self.temp1_hist.append(temps[0])
+                if len(temps) >= 2 and temps[1] is not None: self.temp2_hist.append(temps[1])
+                if len(temps) >= 3 and temps[2] is not None: self.temp3_hist.append(temps[2])
+                if len(temps) >= 4 and temps[3] is not None: self.temp4_hist.append(temps[3])
                 self.interface_hist.append(i)
                 self.growth_hist.append(g)
 
-                self.ax.clear()
-
-                self.ax.plot(self.temp_hist,label="Temp C")
-                self.ax.plot(self.interface_hist,label="Interface mm")
-                self.ax.plot(self.growth_hist,label="Growth mm/min")
-
-                self.ax.legend()
-
-                plt.pause(0.01)
-
-            if img is not None:
-
-                row=int((state.interface_mm or 0)/MM_PER_PIXEL)
-
-                annotated=img.copy()
-
-                cv2.line(
-                    annotated,
-                    (0,row),
-                    (IMAGE_WIDTH,row),
-                    (0,0,255),
-                    2
-                )
-
-                cv2.imshow("Interface",annotated)
-
-                cv2.waitKey(1)
+                self.new_data.set()
 
             time.sleep(DISPLAY_INTERVAL)
 
@@ -735,13 +711,11 @@ def main():
             while True:
                 with state.lock:
                     temps = state.temperatures.copy()
-                    avg_temp = state.temperature
                 formatted = ", ".join(
                     f"T{i+1}={t:.2f}C" if t is not None else f"T{i+1}=None"
                     for i, t in enumerate(temps)
                 )
-                avg_text = f"avg={avg_temp:.2f}C" if avg_temp is not None else "avg=None"
-                print(f"{formatted}, {avg_text}")
+                print(formatted)
                 time.sleep(1)
         except KeyboardInterrupt:
             temp_reader.running = False
@@ -766,7 +740,7 @@ def main():
     tracker = InterfaceTracker(motor)
     display = LiveDisplay()
 
-    threads = [tracker, display]
+    threads = [display, tracker]
 
     # Always read temperature
     temp_reader = TemperatureReader()
@@ -776,12 +750,63 @@ def main():
         logger = Logger()
         threads.append(logger)
 
+    # Initialize matplotlib on main thread
+    plt.ion()
+    fig, ax = plt.subplots()
+    fig2, ax2 = plt.subplots()
+    ax_twin = ax.twinx()
+    ax2_twin = ax2.twinx()
+
     for thread in threads:
         thread.start()
 
     try:
         while True:
-            time.sleep(1)
+            # Handle display updates on main thread
+            if display.new_data.is_set():
+                display.new_data.clear()
+
+                # Update main plot
+                ax.clear()
+                ax.plot(display.interface_hist, label="Interface mm", color='blue')
+                ax.set_ylabel('Interface (mm)', color='blue')
+                ax.tick_params(axis='y', labelcolor='blue')
+
+                ax_twin.plot(display.growth_hist, label="Growth mm/min", color='red')
+                ax_twin.set_ylabel('Growth Rate (mm/min)', color='red')
+                ax_twin.tick_params(axis='y', labelcolor='red')
+
+                plt.figure(fig.number)  # Switch to main figure
+                plt.pause(0.01)
+
+                # Update temperature plot
+                ax2.clear()
+                if display.temp1_hist: ax2_twin.plot(display.temp1_hist, label=CSV_HEADER[1], color='blue')
+                ax2_twin.set_ylabel('Temperature Peltier (°C)', color='blue')
+                ax2_twin.tick_params(axis='y', labelcolor='blue')
+                if display.temp2_hist: ax2.plot(display.temp2_hist, label=CSV_HEADER[2], color='red', linestyle='--')
+                if display.temp3_hist: ax2.plot(display.temp3_hist, label=CSV_HEADER[3], color='red', linestyle=':')
+                if display.temp4_hist: ax2.plot(display.temp4_hist, label=CSV_HEADER[4], color='red', linestyle='-.')
+                ax2.set_ylabel('Temperature water (°C)', color='red')
+                ax2.tick_params(axis='y', labelcolor='red')
+                ax2.legend()
+
+                plt.figure(fig2.number)  # Switch to temperature figure
+                plt.pause(0.01)
+
+                # Handle camera display
+                with state.lock:
+                    img = state.image
+                    interface_mm = state.interface_mm
+
+                if img is not None:
+                    row = int((interface_mm or 0) / MM_PER_PIXEL)
+                    annotated = img.copy()
+                    cv2.line(annotated, (0, row), (IMAGE_WIDTH, row), (0, 0, 255), 2)
+                    cv2.imshow("Interface", annotated)
+                    cv2.waitKey(1)
+
+            time.sleep(DISPLAY_INTERVAL)
     except KeyboardInterrupt:
         for thread in threads:
             thread.running = False
