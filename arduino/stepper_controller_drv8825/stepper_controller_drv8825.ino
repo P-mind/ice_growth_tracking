@@ -1,10 +1,10 @@
-#define STEP_PIN 6
-#define DIR_PIN 7
-#define ENABLE_PIN 8
+#define STEP_PIN 6      //Motor X step pin
+#define DIR_PIN 7       //Motor X direction pin
+#define ENABLE_PIN 8    //Motor X enable pin
 
-#define STEP_PIN2 9
-#define DIR_PIN2 10
-#define ENABLE_PIN2 11
+#define STEP_PIN2 5     //Motor Y step pin
+#define DIR_PIN2 4      //Motor Y direction pin
+#define ENABLE_PIN2 12  //Motor Y enable pin
 
 long position_steps = 0;
 long position_steps2 = 0;
