@@ -211,6 +211,15 @@ class ArduinoStepper:
         if not line.startswith("START2 OK"):
             raise RuntimeError(f"Failed to start motor2: {line}")
 
+    def stop_motor2(self):
+        """
+        Stops the secondary motor.
+        """
+        self.ser.write(b"STOP2\n")
+        line=self.ser.readline().decode().strip()
+        if not line.startswith("STOP2 OK"):
+            raise RuntimeError(f"Failed to stop motor2: {line}")
+
     def get_position_mm(self):
         """
         Retrieves the current motor position in millimeters.
@@ -487,7 +496,7 @@ class InterfaceTracker(threading.Thread):
                 continue
 
             # Rotate camera frame 180 degrees for correct orientation
-            # frame = cv2.rotate(frame, cv2.ROTATE_180)
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
 
             row,confidence = detect_interface(frame)
 
@@ -834,6 +843,12 @@ def main():
 
             time.sleep(DISPLAY_INTERVAL)
     except KeyboardInterrupt:
+        if not args.no_motor and isinstance(motor, ArduinoStepper):
+            try:
+                motor.stop_motor2()
+            except Exception as e:
+                print(f"Warning: failed to stop motor2 cleanly: {e}")
+
         for thread in threads:
             thread.running = False
 
