@@ -487,7 +487,7 @@ class InterfaceTracker(threading.Thread):
                 continue
 
             # Rotate camera frame 180 degrees for correct orientation
-            frame = cv2.rotate(frame, cv2.ROTATE_180)
+            # frame = cv2.rotate(frame, cv2.ROTATE_180)
 
             row,confidence = detect_interface(frame)
 
@@ -504,7 +504,7 @@ class InterfaceTracker(threading.Thread):
                 error = future - TARGET_INTERFACE_MM
                 steps = int(error * STEPS_PER_MM * 0.5)
                 if abs(error) > 0.02:
-                    self.motor.move_steps(-steps)
+                    self.motor.move_steps(steps)
             # Short Loss (Prediction Hold)
             elif self.lost_counter < 3:
                 interface_mm = 0
@@ -512,7 +512,7 @@ class InterfaceTracker(threading.Thread):
                 predicted = height + velocity * CAPTURE_INTERVAL
                 error = predicted - TARGET_INTERFACE_MM
                 steps = int(error * STEPS_PER_MM * 0.3)
-                self.motor.move_steps(-steps)
+                self.motor.move_steps(steps)
             # Long Loss (Search Mode)
             else:
                 print("Interface lost — searching")
@@ -523,11 +523,14 @@ class InterfaceTracker(threading.Thread):
                     self.search_direction *= -1
             
             # Prevent stage runaway
-            if abs(self.motor.get_position_mm()) < MAX_TRAVEL_MM:
+            motor_pos = self.motor.get_position_mm()
+            if abs(motor_pos) > MAX_TRAVEL_MM:
                 print("Prevent stage runaway")
-                self.motor.move_steps(20)
-
-            motor_pos=self.motor.get_position_mm()
+                # Move back towards center
+                if motor_pos > 0:
+                    self.motor.move_steps(-20)  # Move up
+                else:
+                    self.motor.move_steps(20)   # Move down
 
             # row=detect_interface(frame)
             # interface_mm=row*MM_PER_PIXEL
