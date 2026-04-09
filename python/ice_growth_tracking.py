@@ -90,7 +90,7 @@ FLUSH_INTERVAL = 20
 DISPLAY_INTERVAL = 0.5
 
 TARGET_INTERFACE_MM = 10
-INTERFACE_CONF_THRESHOLD = 2.0  # Pixel
+INTERFACE_CONF_THRESHOLD = 5.0  # Pixel
 
 MAX_TRAVEL_MM = 80      # Prevent motor from moving too far in case of tracking loss
 
@@ -535,7 +535,6 @@ class InterfaceTracker(threading.Thread):
             frame = cv2.rotate(frame, cv2.ROTATE_180)
 
             row,confidence = detect_interface(frame)
-
             if row is None or confidence < INTERFACE_CONF_THRESHOLD:
                 self.lost_counter += 1
             else:
