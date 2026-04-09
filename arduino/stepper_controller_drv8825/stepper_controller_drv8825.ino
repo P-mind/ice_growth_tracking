@@ -9,10 +9,10 @@
 long position_steps = 0;
 long position_steps2 = 0;
 
-// Motor 2 timer state and RPM control
-volatile int step_pin_state2 = LOW;
-float motor2_rpm = 0.0;
-bool motor2_enabled = false;
+// Motor 2 simple step-based control
+bool motor2_running = false;
+unsigned long motor2_step_interval_us = 3500;
+unsigned long motor2_last_step_us = 0;
 
 float accel = 2000.0;   // steps/s²
 int max_speed = 2000;   // steps/s
@@ -23,6 +23,30 @@ void stepPulse(unsigned int delay_us)
   delayMicroseconds(delay_us);
   digitalWrite(STEP_PIN, LOW);
   delayMicroseconds(delay_us);
+}
+
+void stepPulse2()
+{
+  digitalWrite(STEP_PIN2, HIGH);
+  delayMicroseconds(2);
+  digitalWrite(STEP_PIN2, LOW);
+}
+
+void serviceMotor2()
+{
+  if(!motor2_running || motor2_step_interval_us == 0)
+    return;
+
+  unsigned long now = micros();
+
+  if(now - motor2_last_step_us >= motor2_step_interval_us)
+  {
+    stepPulse2();
+    motor2_last_step_us = now;
+
+    if(digitalRead(DIR_PIN2) == HIGH) position_steps2++;
+    else position_steps2--;
+  }
 }
 
 void moveSteps(long steps, int speed)
@@ -42,6 +66,7 @@ void moveSteps(long steps, int speed)
 
     delay_us = 1000000.0 / v / 2.0;
 
+    serviceMotor2();
     stepPulse(delay_us);
 
     if(dir) position_steps++;
@@ -52,61 +77,55 @@ void moveSteps(long steps, int speed)
   Serial.println(position_steps);
 }
 
-void setMotor2Rpm(int rpm)
+void moveSteps2(long steps, int speed)
 {
-  if(rpm < 0) rpm = 0;
+  bool dir = steps >= 0;
+  digitalWrite(DIR_PIN2, dir);
 
-  motor2_rpm = rpm;
+  long count = abs(steps);
 
-  if(rpm == 0)
+  if(speed <= 0)
+    speed = 1;
+
+  unsigned long step_interval_us = 1000000UL / (unsigned long)speed;
+
+  for(long i = 0; i < count; i++)
   {
-    TIMSK2 &= ~_BV(OCIE2A);
-    return;
+    serviceMotor2();
+    stepPulse2();
+    delayMicroseconds(step_interval_us);
+
+    if(dir) position_steps2++;
+    else position_steps2--;
   }
 
-  float pulses_per_sec = rpm * 200.0 / 60.0 * 2.0;
-  float ocr = 16000000.0 / (8.0 * pulses_per_sec) - 1.0;
-
-  if(ocr < 0.0)
-    ocr = 0.0;
-  if(ocr > 255.0)
-    ocr = 255.0;
-
-  OCR2A = (uint8_t)(ocr + 0.5);
-
-  if(motor2_enabled)
-  {
-    TIMSK2 |= _BV(OCIE2A);
-  }
+  Serial.print("POS2 ");
+  Serial.println(position_steps2);
 }
 
-void startMotor2()
+void startMotor2(int speed)
 {
-  if(motor2_rpm <= 0.0)
+  if(speed == 0)
+  {
+    stopMotor2();
     return;
+  }
 
-  motor2_enabled = true;
-  TCCR2B = _BV(CS21);  // Timer2 prescaler 8
-  TIMSK2 |= _BV(OCIE2A);
+  bool dir = speed > 0;
+  unsigned long abs_speed = abs(speed);
+
+  if(abs_speed == 0)
+    abs_speed = 1;
+
+  digitalWrite(DIR_PIN2, dir);
+  motor2_step_interval_us = 1000000UL / abs_speed;
+  motor2_last_step_us = micros();
+  motor2_running = true;
 }
 
 void stopMotor2()
 {
-  motor2_enabled = false;
-  TIMSK2 &= ~_BV(OCIE2A);
-  TCCR2B = 0;
-}
-
-// Timer2 ISR - drives motor 2 via set RPM
-ISR(TIMER2_COMPA_vect)
-{
-  step_pin_state2 = !step_pin_state2;
-  digitalWrite(STEP_PIN2, step_pin_state2);
-  
-  if(step_pin_state2 == LOW)
-  {
-    position_steps2++;
-  }
+  motor2_running = false;
 }
 
 void setup()
@@ -126,15 +145,12 @@ void setup()
   digitalWrite(DIR_PIN2, HIGH);
 
   Serial.begin(115200);
-  
-  // Configure Timer2 in CTC mode, but do not enable it until the Python script starts motor 2.
-  TCCR2A = _BV(WGM21);  // CTC mode
-  TCCR2B = 0;           // Timer stopped until START2 command
-  TIMSK2 = 0;           // No interrupt yet
 }
 
 void loop()
 {
+  serviceMotor2();
+
   if(Serial.available())
   {
     String cmd = Serial.readStringUntil('\n');
@@ -161,17 +177,20 @@ void loop()
       Serial.println(position_steps2);
     }
 
-    else if(cmd.startsWith("SETRPM"))
+    else if(cmd.startsWith("MOVE2"))
     {
-      int rpm = 0;
-      sscanf(cmd.c_str(),"SETRPM %d",&rpm);
-      setMotor2Rpm(rpm);
-      Serial.println("RPM OK");
+      long steps;
+      int speed;
+
+      sscanf(cmd.c_str(),"MOVE2 %ld %d",&steps,&speed);
+      moveSteps2(steps, speed);
     }
 
     else if(cmd.startsWith("START2"))
     {
-      startMotor2();
+      int speed = 200;
+      sscanf(cmd.c_str(),"START2 %d",&speed);
+      startMotor2(speed);
       Serial.println("START2 OK");
     }
 

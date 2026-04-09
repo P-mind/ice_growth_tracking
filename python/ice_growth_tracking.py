@@ -94,6 +94,8 @@ INTERFACE_CONF_THRESHOLD = 2.0  # Pixel
 
 MAX_TRAVEL_MM = 80      # Prevent motor from moving too far in case of tracking loss
 
+MOTOR2_SPEED = 20000      # Speed for the secondary motor in steps/sec
+
 MM_PER_PIXEL = 0.02
 STEPS_PER_MM = 400
 
@@ -191,24 +193,27 @@ class ArduinoStepper:
             with self.lock:
                 self.position_steps=pos
 
-    def set_rpm(self, rpm):
+    def move_steps2(self, steps, speed=400):
         """
-        Sets the RPM for the secondary motor via Arduino serial.
+        Moves the secondary motor by a specified number of steps at a given speed.
 
         Args:
-            rpm (int): Desired RPM for the second motor.
+            steps (int): Number of steps to move.
+            speed (int, optional): Speed in steps per second.
         """
-        cmd=f"SETRPM {rpm}\n"
+        cmd=f"MOVE2 {steps} {speed}\n"
         self.ser.write(cmd.encode())
         line=self.ser.readline().decode().strip()
-        if not line.startswith("RPM OK"):
-            raise RuntimeError(f"Failed to set RPM: {line}")
+        if line.startswith("POS2"):
+            return int(line.split()[1])
+        raise RuntimeError(f"Failed to move motor2: {line}")
 
-    def start_motor2(self):
+    def start_motor2(self, speed=400):
         """
-        Starts the secondary motor after RPM has been configured.
+        Starts the secondary motor continuously at the requested speed in steps/sec.
         """
-        self.ser.write(b"START2\n")
+        cmd=f"START2 {speed}\n"
+        self.ser.write(cmd.encode())
         line=self.ser.readline().decode().strip()
         if not line.startswith("START2 OK"):
             raise RuntimeError(f"Failed to start motor2: {line}")
@@ -461,13 +466,12 @@ def detect_upper_interface(frame, min_distance=20, height_threshold=0.3):
 
 class InterfaceTracker(threading.Thread):
 
-    def __init__(self,motor, reset_motor=False):
+    def __init__(self,motor):
         """
         Initializes the InterfaceTracker class, a threading class that tracks the interface using camera and motor.
 
         Args:
             motor: Motor control object (e.g., ArduinoStepper or DummyMotor).
-            reset_motor (bool): Whether to reset motor stopped state on startup.
 
         Attributes:
             motor: Motor control instance.
@@ -476,7 +480,6 @@ class InterfaceTracker(threading.Thread):
             cap (cv2.VideoCapture): Camera capture object.
             lost_counter (int): Counter for consecutive interface detection failures.
             search_step (int): Step size for search mode in steps.
-            motor_stopped (bool): Flag to track if motor is stopped due to hitting wall.
         """
         super().__init__()
 
@@ -492,11 +495,29 @@ class InterfaceTracker(threading.Thread):
         # Recovery Variables
         self.lost_counter = 0
         self.search_step = int(STEPS_PER_MM * 0.1)
-        self.motor_stopped = False  # Flag to track if motor is stopped due to hitting wall
-        
-        if reset_motor:
-            self.motor_stopped = False
 
+    def move_up_with_limit(self, steps, speed=1500):
+        """
+        Move the motor upward without exceeding the configured maximum travel.
+
+        Args:
+            steps (int): Requested upward travel in steps.
+            speed (int, optional): Stepper speed in steps/s.
+        """
+        if steps <= 0:
+            return
+
+        current_pos_mm = self.motor.get_position_mm()
+        remaining_mm = MAX_TRAVEL_MM - current_pos_mm
+
+        if remaining_mm <= 0:
+            return
+
+        max_allowed_steps = int(remaining_mm * STEPS_PER_MM)
+        limited_steps = min(steps, max_allowed_steps)
+
+        if limited_steps > 0:
+            self.motor.move_steps(limited_steps, speed=speed)
 
     def run(self):
         """
@@ -519,10 +540,6 @@ class InterfaceTracker(threading.Thread):
                 self.lost_counter += 1
             else:
                 self.lost_counter = 0
-                # Reset motor stopped state when interface is found
-                if self.motor_stopped:
-                    print("Interface found - resetting motor stopped state")
-                    self.motor_stopped = False
 
             # Normal Tracking Mode
             if self.lost_counter == 0:
@@ -532,8 +549,8 @@ class InterfaceTracker(threading.Thread):
                 error = future - TARGET_INTERFACE_MM
                 steps = int(error * STEPS_PER_MM * 0.5)
                 # Only allow upward movement (positive steps)
-                if steps > 0 and abs(error) > 0.02 and not self.motor_stopped:
-                    self.motor.move_steps(steps)
+                if steps > 0 and abs(error) > 0.02:
+                    self.move_up_with_limit(steps)
             # Short Loss (Prediction Hold)
             elif self.lost_counter < 3:
                 interface_mm = 0
@@ -542,31 +559,20 @@ class InterfaceTracker(threading.Thread):
                 error = predicted - TARGET_INTERFACE_MM
                 steps = int(error * STEPS_PER_MM * 0.3)
                 # Only allow upward movement (positive steps)
-                if steps > 0 and not self.motor_stopped:
-                    self.motor.move_steps(steps)
+                if steps > 0:
+                    self.move_up_with_limit(steps)
             # Long Loss (Search Mode)
             else:
                 print("Interface lost — searching")
                 interface_mm = 0
                 height, velocity = 0, 0
-                if not self.motor_stopped:
-                    # For search mode, only search upwards
-                    self.motor.move_steps(self.search_step)
-            
-            # Check for wall hits and stop motor
+                # For search mode, only search upwards within the travel limit
+                self.move_up_with_limit(self.search_step)
+
             motor_pos = self.motor.get_position_mm()
-            if motor_pos >= MAX_TRAVEL_MM:
-                if not self.motor_stopped:
-                    print(f"Motor hit upper wall at position {motor_pos:.2f} mm - stopping motor")
-                    self.motor_stopped = True
-            elif self.motor_stopped and motor_pos < MAX_TRAVEL_MM - 5:  # Allow some hysteresis
-                print(f"Motor moved away from wall - resuming operation")
-                self.motor_stopped = False
 
             # Update motor status
-            if self.motor_stopped:
-                motor_status = "stopped_wall"
-            elif self.lost_counter >= 3:
+            if self.lost_counter >= 3:
                 motor_status = "searching"
             else:
                 motor_status = "running"
@@ -663,6 +669,7 @@ class LiveDisplay(threading.Thread):
 
         self.running=True
 
+        self.time_hist=deque(maxlen=MAX_LENGTH_DISPLAY)
         self.temp1_hist=deque(maxlen=MAX_LENGTH_DISPLAY)
         self.temp2_hist=deque(maxlen=MAX_LENGTH_DISPLAY)
         self.temp3_hist=deque(maxlen=MAX_LENGTH_DISPLAY)
@@ -670,6 +677,7 @@ class LiveDisplay(threading.Thread):
         self.interface_hist=deque(maxlen=MAX_LENGTH_DISPLAY)
         self.growth_hist=deque(maxlen=MAX_LENGTH_DISPLAY)
 
+        self.start_time = time.time()
         self.new_data = threading.Event()
 
     def run(self):
@@ -686,6 +694,9 @@ class LiveDisplay(threading.Thread):
                 img=state.image
 
             if any(t is not None for t in temps):
+
+                elapsed_min = (time.time() - self.start_time) / 60.0
+                self.time_hist.append(elapsed_min)
 
                 if len(temps) >= 1 and temps[0] is not None: self.temp1_hist.append(temps[0])
                 if len(temps) >= 2 and temps[1] is not None: self.temp2_hist.append(temps[1])
@@ -739,8 +750,7 @@ def main():
     parser.add_argument('--display-interval', type=float, default=0.5, help='Display update interval in seconds (default: 0.5)')
     parser.add_argument('--image-width', type=int, default=640, help='Camera image width (default: 640)')
     parser.add_argument('--image-height', type=int, default=480, help='Camera image height (default: 480)')
-    parser.add_argument('--motor2-rpm', type=int, default=120, help='RPM for the secondary motor')
-    parser.add_argument('--reset-motor', action='store_true', help='Reset motor stopped state on startup')
+    parser.add_argument('--motor2-speed', type=int, default=MOTOR2_SPEED, help='Speed for the secondary motor in steps/sec')
     parser.add_argument('--test-arduino', action='store_true', help='Test Arduino serial communication and exit')
 
     args = parser.parse_args()
@@ -791,10 +801,10 @@ def main():
         motor = DummyMotor()
     else:
         motor = ArduinoStepper()
-        motor.set_rpm(args.motor2_rpm)
-        motor.start_motor2()
+        print(f"Motor2 start: speed={MOTOR2_SPEED} steps/s")
+        motor.start_motor2(MOTOR2_SPEED)
 
-    tracker = InterfaceTracker(motor, reset_motor=args.reset_motor)
+    tracker = InterfaceTracker(motor)
     display = LiveDisplay()
 
     threads = [display, tracker]
@@ -825,11 +835,13 @@ def main():
 
                 # Update main plot
                 ax.clear()
-                ax.plot(display.interface_hist, label="Interface mm", color='blue')
+                ax_twin.clear()
+                ax.plot(display.time_hist, display.interface_hist, label="Interface mm", color='blue')
+                ax.set_xlabel('Time (min)')
                 ax.set_ylabel('Interface (mm)', color='blue')
                 ax.tick_params(axis='y', labelcolor='blue')
 
-                ax_twin.plot(display.growth_hist, label="Growth mm/min", color='red')
+                ax_twin.plot(display.time_hist, display.growth_hist, label="Growth mm/min", color='red')
                 ax_twin.set_ylabel('Growth Rate (mm/min)', color='red')
                 ax_twin.tick_params(axis='y', labelcolor='red')
 
@@ -838,12 +850,15 @@ def main():
 
                 # Update temperature plot
                 ax2.clear()
-                if display.temp1_hist: ax2_twin.plot(display.temp1_hist, label=CSV_HEADER[1], color='blue')
+                ax2_twin.clear()
+                if display.temp1_hist: ax2_twin.plot(display.time_hist, display.temp1_hist, label=CSV_HEADER[1], color='blue')
+                ax2_twin.set_xlabel('Time (min)')
                 ax2_twin.set_ylabel('Temperature Peltier (°C)', color='blue')
                 ax2_twin.tick_params(axis='y', labelcolor='blue')
-                if display.temp2_hist: ax2.plot(display.temp2_hist, label=CSV_HEADER[2], color='red', linestyle='--')
-                if display.temp3_hist: ax2.plot(display.temp3_hist, label=CSV_HEADER[3], color='red', linestyle=':')
-                if display.temp4_hist: ax2.plot(display.temp4_hist, label=CSV_HEADER[4], color='red', linestyle='-.')
+                if display.temp2_hist: ax2.plot(display.time_hist, display.temp2_hist, label=CSV_HEADER[2], color='red', linestyle='--')
+                if display.temp3_hist: ax2.plot(display.time_hist, display.temp3_hist, label=CSV_HEADER[3], color='red', linestyle=':')
+                if display.temp4_hist: ax2.plot(display.time_hist, display.temp4_hist, label=CSV_HEADER[4], color='red', linestyle='-.')
+                ax2.set_xlabel('Time (min)')
                 ax2.set_ylabel('Temperature water (°C)', color='red')
                 ax2.tick_params(axis='y', labelcolor='red')
                 ax2.legend()
