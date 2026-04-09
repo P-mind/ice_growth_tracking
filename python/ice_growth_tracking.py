@@ -697,12 +697,14 @@ class LiveDisplay(threading.Thread):
                 elapsed_min = (time.time() - self.start_time) / 60.0
                 self.time_hist.append(elapsed_min)
 
-                if len(temps) >= 1 and temps[0] is not None: self.temp1_hist.append(temps[0])
-                if len(temps) >= 2 and temps[1] is not None: self.temp2_hist.append(temps[1])
-                if len(temps) >= 3 and temps[2] is not None: self.temp3_hist.append(temps[2])
-                if len(temps) >= 4 and temps[3] is not None: self.temp4_hist.append(temps[3])
-                self.interface_hist.append(i)
-                self.growth_hist.append(g)
+                # Keep every history deque aligned with the shared time axis.
+                padded_temps = list(temps[:4]) + [None] * max(0, 4 - len(temps))
+                self.temp1_hist.append(np.nan if padded_temps[0] is None else padded_temps[0])
+                self.temp2_hist.append(np.nan if padded_temps[1] is None else padded_temps[1])
+                self.temp3_hist.append(np.nan if padded_temps[2] is None else padded_temps[2])
+                self.temp4_hist.append(np.nan if padded_temps[3] is None else padded_temps[3])
+                self.interface_hist.append(np.nan if i is None else i)
+                self.growth_hist.append(np.nan if g is None else g)
 
                 self.new_data.set()
 
