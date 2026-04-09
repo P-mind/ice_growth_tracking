@@ -475,7 +475,6 @@ class InterfaceTracker(threading.Thread):
             kalman (InterfaceKalman): Kalman filter for interface smoothing.
             cap (cv2.VideoCapture): Camera capture object.
             lost_counter (int): Counter for consecutive interface detection failures.
-            search_direction (int): Direction for search mode (1 or -1).
             search_step (int): Step size for search mode in steps.
             motor_stopped (bool): Flag to track if motor is stopped due to hitting wall.
         """
@@ -492,7 +491,6 @@ class InterfaceTracker(threading.Thread):
 
         # Recovery Variables
         self.lost_counter = 0
-        self.search_direction = 1
         self.search_step = int(STEPS_PER_MM * 0.1)
         self.motor_stopped = False  # Flag to track if motor is stopped due to hitting wall
         
@@ -533,7 +531,8 @@ class InterfaceTracker(threading.Thread):
                 future = height + velocity * CAPTURE_INTERVAL
                 error = future - TARGET_INTERFACE_MM
                 steps = int(error * STEPS_PER_MM * 0.5)
-                if abs(error) > 0.02 and not self.motor_stopped:
+                # Only allow upward movement (positive steps)
+                if steps > 0 and abs(error) > 0.02 and not self.motor_stopped:
                     self.motor.move_steps(steps)
             # Short Loss (Prediction Hold)
             elif self.lost_counter < 3:
@@ -542,7 +541,8 @@ class InterfaceTracker(threading.Thread):
                 predicted = height + velocity * CAPTURE_INTERVAL
                 error = predicted - TARGET_INTERFACE_MM
                 steps = int(error * STEPS_PER_MM * 0.3)
-                if not self.motor_stopped:
+                # Only allow upward movement (positive steps)
+                if steps > 0 and not self.motor_stopped:
                     self.motor.move_steps(steps)
             # Long Loss (Search Mode)
             else:
@@ -550,17 +550,16 @@ class InterfaceTracker(threading.Thread):
                 interface_mm = 0
                 height, velocity = 0, 0
                 if not self.motor_stopped:
-                    self.motor.move_steps(self.search_direction * self.search_step)
-                    if self.lost_counter % 20 == 0:
-                        self.search_direction *= -1
+                    # For search mode, only search upwards
+                    self.motor.move_steps(self.search_step)
             
             # Check for wall hits and stop motor
             motor_pos = self.motor.get_position_mm()
-            if abs(motor_pos) >= MAX_TRAVEL_MM:
+            if motor_pos >= MAX_TRAVEL_MM:
                 if not self.motor_stopped:
-                    print(f"Motor hit wall at position {motor_pos:.2f} mm - stopping motor")
+                    print(f"Motor hit upper wall at position {motor_pos:.2f} mm - stopping motor")
                     self.motor_stopped = True
-            elif self.motor_stopped and abs(motor_pos) < MAX_TRAVEL_MM - 5:  # Allow some hysteresis
+            elif self.motor_stopped and motor_pos < MAX_TRAVEL_MM - 5:  # Allow some hysteresis
                 print(f"Motor moved away from wall - resuming operation")
                 self.motor_stopped = False
 
@@ -742,6 +741,7 @@ def main():
     parser.add_argument('--image-height', type=int, default=480, help='Camera image height (default: 480)')
     parser.add_argument('--motor2-rpm', type=int, default=120, help='RPM for the secondary motor')
     parser.add_argument('--reset-motor', action='store_true', help='Reset motor stopped state on startup')
+    parser.add_argument('--test-arduino', action='store_true', help='Test Arduino serial communication and exit')
 
     args = parser.parse_args()
 
