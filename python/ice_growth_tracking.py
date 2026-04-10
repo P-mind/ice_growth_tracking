@@ -94,7 +94,8 @@ INTERFACE_CONF_THRESHOLD = 5.0  # Pixel
 
 MAX_TRAVEL_MM = 80      # Prevent motor from moving too far in case of tracking loss
 
-MOTOR2_SPEED = 20000      # Speed for the secondary motor in steps/sec
+MOTOR2_SPEED_INIT = 200      # Initial speed for the secondary motor in steps/sec
+MOTOR2_SPEED_STEP = 500   # Live adjustment step for keyboard control
 
 MM_PER_PIXEL = 0.02
 STEPS_PER_MM = 400
@@ -115,6 +116,7 @@ CSV_HEADER = [
                 "filtered_interface_mm",
                 "growth_rate_mm_min",
                 "motor_position_mm",
+                "motor2_speed_steps_s",
                 "motor_status"
             ]
 
@@ -147,6 +149,7 @@ class SystemState:
         self.motor_position_mm = 0
         self.pwm_duty = 0
         self.motor_status = "running"  # "running", "stopped_wall", "searching"
+        self.motor2_speed = MOTOR2_SPEED_INIT
 
         self.image = None
 
@@ -172,6 +175,7 @@ class ArduinoStepper:
 
         self.position_steps = 0
         self.lock = threading.Lock()
+        self.command_lock = threading.Lock()
 
     def move_steps(self,steps,speed=1500):
         """
@@ -182,9 +186,10 @@ class ArduinoStepper:
             speed (int, optional): Speed of movement in steps per second (default: 1500).
         """
         cmd=f"MOVE {steps} {speed}\n"
-        self.ser.write(cmd.encode())
 
-        line=self.ser.readline().decode().strip()
+        with self.command_lock:
+            self.ser.write(cmd.encode())
+            line=self.ser.readline().decode().strip()
 
         if line.startswith("POS"):
 
@@ -192,6 +197,9 @@ class ArduinoStepper:
 
             with self.lock:
                 self.position_steps=pos
+            return
+
+        raise RuntimeError(f"Failed to move motor: {line}")
 
     def move_steps2(self, steps, speed=400):
         """
@@ -202,8 +210,9 @@ class ArduinoStepper:
             speed (int, optional): Speed in steps per second.
         """
         cmd=f"MOVE2 {steps} {speed}\n"
-        self.ser.write(cmd.encode())
-        line=self.ser.readline().decode().strip()
+        with self.command_lock:
+            self.ser.write(cmd.encode())
+            line=self.ser.readline().decode().strip()
         if line.startswith("POS2"):
             return int(line.split()[1])
         raise RuntimeError(f"Failed to move motor2: {line}")
@@ -213,17 +222,25 @@ class ArduinoStepper:
         Starts the secondary motor continuously at the requested speed in steps/sec.
         """
         cmd=f"START2 {speed}\n"
-        self.ser.write(cmd.encode())
-        line=self.ser.readline().decode().strip()
+        with self.command_lock:
+            self.ser.write(cmd.encode())
+            line=self.ser.readline().decode().strip()
         if not line.startswith("START2 OK"):
             raise RuntimeError(f"Failed to start motor2: {line}")
+
+    def set_motor2_speed(self, speed):
+        """
+        Updates the secondary motor speed while it is running.
+        """
+        self.start_motor2(speed)
 
     def stop_motor2(self):
         """
         Stops the secondary motor.
         """
-        self.ser.write(b"STOP2\n")
-        line=self.ser.readline().decode().strip()
+        with self.command_lock:
+            self.ser.write(b"STOP2\n")
+            line=self.ser.readline().decode().strip()
         if not line.startswith("STOP2 OK"):
             raise RuntimeError(f"Failed to stop motor2: {line}")
 
@@ -231,8 +248,9 @@ class ArduinoStepper:
         """
         Resets the system state (can be used to clear motor stopped flags).
         """
-        self.ser.write(b"RESET\n")
-        line=self.ser.readline().decode().strip()
+        with self.command_lock:
+            self.ser.write(b"RESET\n")
+            line=self.ser.readline().decode().strip()
         if not line.startswith("RESET OK"):
             raise RuntimeError(f"Failed to reset system: {line}")
 
@@ -635,6 +653,7 @@ class Logger(threading.Thread):
                     state.interface_filtered,
                     state.growth_rate,
                     state.motor_position_mm,
+                    state.motor2_speed,
                     state.motor_status
                 ]
 
@@ -676,8 +695,44 @@ class LiveDisplay(threading.Thread):
         self.interface_hist=deque(maxlen=MAX_LENGTH_DISPLAY)
         self.growth_hist=deque(maxlen=MAX_LENGTH_DISPLAY)
 
+        self.history_deques = (
+            self.time_hist,
+            self.temp1_hist,
+            self.temp2_hist,
+            self.temp3_hist,
+            self.temp4_hist,
+            self.interface_hist,
+            self.growth_hist,
+        )
+        self.history_lock = threading.Lock()
+
         self.start_time = time.time()
         self.new_data = threading.Event()
+
+    def _sync_history_lengths(self):
+        """
+        Keep all history deques aligned to the same number of samples.
+        """
+        target_len = min(len(hist) for hist in self.history_deques)
+        for hist in self.history_deques:
+            while len(hist) > target_len:
+                hist.popleft()
+
+    def get_plot_data(self):
+        """
+        Return synchronized snapshots of the display histories for plotting.
+        """
+        with self.history_lock:
+            self._sync_history_lengths()
+            return {
+                "time": list(self.time_hist),
+                "temp1": list(self.temp1_hist),
+                "temp2": list(self.temp2_hist),
+                "temp3": list(self.temp3_hist),
+                "temp4": list(self.temp4_hist),
+                "interface": list(self.interface_hist),
+                "growth": list(self.growth_hist),
+            }
 
     def run(self):
         """
@@ -692,19 +747,21 @@ class LiveDisplay(threading.Thread):
                 g=state.growth_rate
                 img=state.image
 
-            if any(t is not None for t in temps):
+            padded_temps = list(temps[:4]) + [None] * max(0, 4 - len(temps))
+            has_sample = any(t is not None for t in padded_temps) or i is not None or g is not None or img is not None
+
+            if has_sample:
 
                 elapsed_min = (time.time() - self.start_time) / 60.0
-                self.time_hist.append(elapsed_min)
-
-                # Keep every history deque aligned with the shared time axis.
-                padded_temps = list(temps[:4]) + [None] * max(0, 4 - len(temps))
-                self.temp1_hist.append(np.nan if padded_temps[0] is None else padded_temps[0])
-                self.temp2_hist.append(np.nan if padded_temps[1] is None else padded_temps[1])
-                self.temp3_hist.append(np.nan if padded_temps[2] is None else padded_temps[2])
-                self.temp4_hist.append(np.nan if padded_temps[3] is None else padded_temps[3])
-                self.interface_hist.append(np.nan if i is None else i)
-                self.growth_hist.append(np.nan if g is None else g)
+                with self.history_lock:
+                    self.time_hist.append(elapsed_min)
+                    self.temp1_hist.append(np.nan if padded_temps[0] is None else padded_temps[0])
+                    self.temp2_hist.append(np.nan if padded_temps[1] is None else padded_temps[1])
+                    self.temp3_hist.append(np.nan if padded_temps[2] is None else padded_temps[2])
+                    self.temp4_hist.append(np.nan if padded_temps[3] is None else padded_temps[3])
+                    self.interface_hist.append(np.nan if i is None else i)
+                    self.growth_hist.append(np.nan if g is None else g)
+                    self._sync_history_lengths()
 
                 self.new_data.set()
 
@@ -732,6 +789,32 @@ class DummyMotor:
         """
         return 0.0
 
+
+def update_motor2_speed(motor, new_speed):
+    """
+    Updates the secondary motor speed while the experiment is running.
+    """
+    global MOTOR2_SPEED
+
+    new_speed = int(new_speed)
+
+    try:
+        if isinstance(motor, ArduinoStepper):
+            motor.set_motor2_speed(new_speed)
+    except Exception as e:
+        print(f"Warning: failed to update motor2 speed: {e}")
+        return
+
+    MOTOR2_SPEED = new_speed
+
+    with state.lock:
+        state.motor2_speed = MOTOR2_SPEED
+
+    if MOTOR2_SPEED == 0:
+        print("Motor2 stopped")
+    else:
+        print(f"Motor2 speed updated to {MOTOR2_SPEED} steps/s")
+
 ########################################
 # MAIN
 ########################################
@@ -751,7 +834,7 @@ def main():
     parser.add_argument('--display-interval', type=float, default=0.5, help='Display update interval in seconds (default: 0.5)')
     parser.add_argument('--image-width', type=int, default=640, help='Camera image width (default: 640)')
     parser.add_argument('--image-height', type=int, default=480, help='Camera image height (default: 480)')
-    parser.add_argument('--motor2-speed', type=int, default=MOTOR2_SPEED, help='Speed for the secondary motor in steps/sec')
+    parser.add_argument('--motor2-speed', type=int, default=MOTOR2_SPEED_INIT, help='Initial speed for the secondary motor in steps/sec')
     parser.add_argument('--test-arduino', action='store_true', help='Test Arduino serial communication and exit')
 
     args = parser.parse_args()
@@ -797,12 +880,18 @@ def main():
     IMAGE_WIDTH = args.image_width
     global IMAGE_HEIGHT
     IMAGE_HEIGHT = args.image_height
+    global MOTOR2_SPEED
+    MOTOR2_SPEED = MOTOR2_SPEED_INIT
+
+    with state.lock:
+        state.motor2_speed = MOTOR2_SPEED
 
     if args.no_motor:
         motor = DummyMotor()
     else:
         motor = ArduinoStepper()
         print(f"Motor2 start: speed={MOTOR2_SPEED} steps/s")
+        print("Motor2 controls: '[' slower | ']' faster | '0' stop")
         motor.start_motor2(MOTOR2_SPEED)
 
     tracker = InterfaceTracker(motor)
@@ -834,15 +923,20 @@ def main():
             if display.new_data.is_set():
                 display.new_data.clear()
 
+                plot_data = display.get_plot_data()
+                time_data = plot_data["time"]
+
                 # Update main plot
                 ax.clear()
                 ax_twin.clear()
-                ax.plot(display.time_hist, display.interface_hist, label="Interface mm", color='blue')
+                if time_data:
+                    ax.plot(time_data, plot_data["interface"], label="Interface mm", color='blue')
                 ax.set_xlabel('Time (min)')
                 ax.set_ylabel('Interface (mm)', color='blue')
                 ax.tick_params(axis='y', labelcolor='blue')
 
-                ax_twin.plot(display.time_hist, display.growth_hist, label="Growth mm/min", color='red')
+                if time_data:
+                    ax_twin.plot(time_data, plot_data["growth"], label="Growth mm/min", color='red')
                 ax_twin.set_ylabel('Growth Rate (mm/min)', color='red')
                 ax_twin.tick_params(axis='y', labelcolor='red')
 
@@ -852,13 +946,17 @@ def main():
                 # Update temperature plot
                 ax2.clear()
                 ax2_twin.clear()
-                if display.temp1_hist: ax2_twin.plot(display.time_hist, display.temp1_hist, label=CSV_HEADER[1], color='blue')
+                if time_data and plot_data["temp1"]:
+                    ax2_twin.plot(time_data, plot_data["temp1"], label=CSV_HEADER[1], color='blue')
                 ax2_twin.set_xlabel('Time (min)')
                 ax2_twin.set_ylabel('Temperature Peltier (°C)', color='blue')
                 ax2_twin.tick_params(axis='y', labelcolor='blue')
-                if display.temp2_hist: ax2.plot(display.time_hist, display.temp2_hist, label=CSV_HEADER[2], color='red', linestyle='--')
-                if display.temp3_hist: ax2.plot(display.time_hist, display.temp3_hist, label=CSV_HEADER[3], color='red', linestyle=':')
-                if display.temp4_hist: ax2.plot(display.time_hist, display.temp4_hist, label=CSV_HEADER[4], color='red', linestyle='-.')
+                if time_data and plot_data["temp2"]:
+                    ax2.plot(time_data, plot_data["temp2"], label=CSV_HEADER[2], color='red', linestyle='--')
+                if time_data and plot_data["temp3"]:
+                    ax2.plot(time_data, plot_data["temp3"], label=CSV_HEADER[3], color='red', linestyle=':')
+                if time_data and plot_data["temp4"]:
+                    ax2.plot(time_data, plot_data["temp4"], label=CSV_HEADER[4], color='red', linestyle='-.')
                 ax2.set_xlabel('Time (min)')
                 ax2.set_ylabel('Temperature water (°C)', color='red')
                 ax2.tick_params(axis='y', labelcolor='red')
@@ -873,11 +971,24 @@ def main():
                     interface_mm = state.interface_mm
 
                 if img is not None:
+                    with state.lock:
+                        motor2_speed = state.motor2_speed
+
                     row = int((interface_mm or 0) / MM_PER_PIXEL)
                     annotated = img.copy()
                     cv2.line(annotated, (0, row), (IMAGE_WIDTH, row), (0, 0, 255), 2)
+                    cv2.putText(annotated, f"Motor2: {motor2_speed} steps/s", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    cv2.putText(annotated, "Controls: [ slower | ] faster | 0 stop", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                     cv2.imshow("Interface", annotated)
-                    cv2.waitKey(1)
+
+                key = cv2.waitKey(1) & 0xFF
+                if not args.no_motor and isinstance(motor, ArduinoStepper):
+                    if key in (ord(']'), ord('='), ord('+')):
+                        update_motor2_speed(motor, MOTOR2_SPEED + MOTOR2_SPEED_STEP)
+                    elif key in (ord('['), ord('-'), ord('_')):
+                        update_motor2_speed(motor, max(0, MOTOR2_SPEED - MOTOR2_SPEED_STEP))
+                    elif key == ord('0'):
+                        update_motor2_speed(motor, 0)
 
             time.sleep(DISPLAY_INTERVAL)
     except KeyboardInterrupt:
