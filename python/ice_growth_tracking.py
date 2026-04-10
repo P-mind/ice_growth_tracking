@@ -89,13 +89,23 @@ LOG_INTERVAL = 1.0
 FLUSH_INTERVAL = 20
 DISPLAY_INTERVAL = 0.5
 
-TARGET_INTERFACE_MM = 10
+TARGET_INTERFACE_MM = 0.05  # None keeps the detected interface centered in the frame
 INTERFACE_CONF_THRESHOLD = 5.0  # Pixel
+INTERFACE_SEARCH_RANGE_PX = 50  # Restrict detection to a central horizontal band
 
 MAX_TRAVEL_MM = 80      # Prevent motor from moving too far in case of tracking loss
 
 MOTOR2_SPEED_INIT = 200      # Initial speed for the secondary motor in steps/sec
-MOTOR2_SPEED_STEP = 500   # Live adjustment step for keyboard control
+MOTOR2_SPEED_STEP = 2000   # Live adjustment step for keyboard control
+
+# Predefine minimum, maximum, and default speeds for motor 2 to ensure safe operation
+MOTOR2_SPEED_MAX = 20000
+MOTOR2_SPEED_MIN = 500  
+MOTOR2_SPEED_AVG = 10000
+
+MOTOR1_MANUAL_STEP_MM = 0.25   # Manual nudge per keypress for motor 1
+MOTOR1_MANUAL_SPEED = 400     # Speed for manual motor 1 nudges in steps/sec
+MANUAL_OVERRIDE_DURATION = 5.0 # Seconds to pause auto-tracking after a manual nudge
 
 MM_PER_PIXEL = 0.02
 STEPS_PER_MM = 400
@@ -117,6 +127,7 @@ CSV_HEADER = [
                 "growth_rate_mm_min",
                 "motor_position_mm",
                 "motor2_speed_steps_s",
+                "interface_source",
                 "motor_status"
             ]
 
@@ -145,11 +156,14 @@ class SystemState:
         self.temperatures = [None] * NUM_TEMP_SENSORS
         self.interface_mm = None
         self.interface_filtered = None
+        self.interface_fallback = False
+        self.interface_source = "detected"
         self.growth_rate = None
         self.motor_position_mm = 0
         self.pwm_duty = 0
-        self.motor_status = "running"  # "running", "stopped_wall", "searching"
+        self.motor_status = "running"  # "running", "stopped_wall", "lost", "manual", "fallback"
         self.motor2_speed = MOTOR2_SPEED_INIT
+        self.manual_override_until = 0.0
 
         self.image = None
 
@@ -177,7 +191,7 @@ class ArduinoStepper:
         self.lock = threading.Lock()
         self.command_lock = threading.Lock()
 
-    def move_steps(self,steps,speed=1500):
+    def move_steps(self,steps,speed=200):
         """
         Moves the stepper motor by a specified number of steps at a given speed.
 
@@ -361,49 +375,82 @@ class InterfaceKalman:
 # SUBPIXEL INTERFACE DETECTION
 ########################################
 
+def get_interface_search_bounds(frame_height, search_range_px=INTERFACE_SEARCH_RANGE_PX):
+    """
+    Return the start/end rows of the central horizontal band used for interface detection.
+    """
+    band_height = max(3, min(int(search_range_px), int(frame_height)))
+    center_row = int(frame_height) // 2
+    half_band = band_height // 2
+
+    row_start = max(0, center_row - half_band)
+    row_end = min(int(frame_height), row_start + band_height)
+    row_start = max(0, row_end - band_height)
+
+    return row_start, row_end
+
+
+def get_target_interface_mm(frame_height, target_interface_mm=TARGET_INTERFACE_MM):
+    """
+    Return the target interface position in mm.
+
+    If `TARGET_INTERFACE_MM` is None, the center of the search band/frame is used.
+    """
+    if target_interface_mm is not None:
+        return float(target_interface_mm)
+
+    row_start, row_end = get_interface_search_bounds(frame_height)
+    target_row = 0.5 * (row_start + row_end - 1)
+    return target_row * MM_PER_PIXEL
+
+
 def detect_interface(frame):
     """
-    Detects the ice-water interface in a camera frame by converting to grayscale, applying Gaussian blur, 
-    computing vertical gradients with Sobel operator, and finding the row with the strongest gradient.
+    Detect the ice-water interface using only the middle horizontal search band.
 
     Args:
         frame: Input camera frame (BGR image).
 
     Returns:
-        tuple: (interface_position_pixels, confidence) where interface_position_pixels is the subpixel-accurate 
-               position in pixels, or None if detection fails, and confidence is a score based on peak strength 
-               relative to mean gradient.
+        tuple: (interface_position_pixels, confidence) where interface_position_pixels is the subpixel-accurate
+               position in pixels, or None if detection fails, and confidence is based on the gradient peak
+               strength within the center horizontal band.
     """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray,(5,5),0)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    sobel = cv2.Sobel(blur,cv2.CV_64F,0,1,ksize=3)
+    sobel = cv2.Sobel(blur, cv2.CV_64F, 0, 1, ksize=3)
     gradient = np.abs(sobel)
 
     row_strength = gradient.mean(axis=1)
+    row_start, row_end = get_interface_search_bounds(frame.shape[0])
+    search_strength = row_strength[row_start:row_end]
 
-    idx = np.argmax(row_strength)
+    if len(search_strength) < 3:
+        return None, 0
+
+    local_idx = int(np.argmax(search_strength))
+    idx = row_start + local_idx
 
     peak = row_strength[idx]
-    mean = np.mean(row_strength)
-
+    mean = np.mean(search_strength)
     confidence = peak / (mean + 1e-6)
 
-    if idx<=1 or idx>=len(row_strength)-2:
-        return None,0
+    if local_idx <= 1 or local_idx >= len(search_strength) - 2:
+        return None, 0
 
-    g1=row_strength[idx-1]
-    g2=row_strength[idx]
-    g3=row_strength[idx+1]
+    g1 = row_strength[idx - 1]
+    g2 = row_strength[idx]
+    g3 = row_strength[idx + 1]
 
-    denom=(g1-2*g2+g3)
+    denom = (g1 - 2 * g2 + g3)
 
-    if abs(denom)<1e-6:
-        sub=idx
+    if abs(denom) < 1e-6:
+        sub = idx
     else:
-        sub=idx + 0.5*(g1-g3)/denom
+        sub = idx + 0.5 * (g1 - g3) / denom
 
-    return sub,confidence
+    return sub, confidence
 
 ########################################
 # DUAL INTERFACE DETECTION
@@ -432,16 +479,22 @@ def detect_upper_interface(frame, min_distance=20, height_threshold=0.3):
     gradient = np.abs(sobel)
     
     row_strength = gradient.mean(axis=1)
-    
-    mean_strength = np.mean(row_strength)
-    
-    # Find local maxima (peaks)
+    row_start, row_end = get_interface_search_bounds(frame.shape[0])
+    search_strength = row_strength[row_start:row_end]
+
+    if len(search_strength) < 3:
+        return None, 0
+
+    mean_strength = np.mean(search_strength)
+
+    # Find local maxima (peaks) only in the center horizontal band
     peaks = []
-    for i in range(1, len(row_strength) - 1):
-        if (row_strength[i] > row_strength[i-1] and 
-            row_strength[i] > row_strength[i+1] and
-            row_strength[i] > mean_strength * height_threshold):
-            peaks.append((i, row_strength[i]))
+    for local_idx in range(1, len(search_strength) - 1):
+        if (search_strength[local_idx] > search_strength[local_idx - 1] and
+            search_strength[local_idx] > search_strength[local_idx + 1] and
+            search_strength[local_idx] > mean_strength * height_threshold):
+            idx = row_start + local_idx
+            peaks.append((idx, row_strength[idx]))
     
     if len(peaks) == 0:
         return None, 0
@@ -514,33 +567,41 @@ class InterfaceTracker(threading.Thread):
         self.lost_counter = 0
         self.search_step = int(STEPS_PER_MM * 0.1)
 
-    def move_up_with_limit(self, steps, speed=1500):
+    def move_with_limit(self, steps, speed=200):
         """
-        Move the motor upward without exceeding the configured maximum travel.
+        Move the motor within the configured travel limits.
+
+        Positive steps move upward; negative steps move backward/downward.
 
         Args:
-            steps (int): Requested upward travel in steps.
+            steps (int): Requested travel in steps.
             speed (int, optional): Stepper speed in steps/s.
         """
-        if steps <= 0:
+        if steps == 0:
             return
 
         current_pos_mm = self.motor.get_position_mm()
-        remaining_mm = MAX_TRAVEL_MM - current_pos_mm
 
-        if remaining_mm <= 0:
-            return
+        if steps > 0:
+            remaining_mm = MAX_TRAVEL_MM - current_pos_mm
+            if remaining_mm <= 0:
+                return
+            max_allowed_steps = int(remaining_mm * STEPS_PER_MM)
+            limited_steps = min(steps, max_allowed_steps)
+        else:
+            available_mm = max(0.0, current_pos_mm)
+            if available_mm <= 0:
+                return
+            max_allowed_steps = int(available_mm * STEPS_PER_MM)
+            limited_steps = -min(abs(steps), max_allowed_steps)
 
-        max_allowed_steps = int(remaining_mm * STEPS_PER_MM)
-        limited_steps = min(steps, max_allowed_steps)
-
-        if limited_steps > 0:
+        if limited_steps != 0:
             self.motor.move_steps(limited_steps, speed=speed)
 
     def run(self):
         """
-        Runs the interface tracking loop, capturing frames, detecting interface, applying Kalman filter, 
-        and controlling motor to keep interface at target position. Includes recovery modes for lost interface.
+        Runs the interface tracking loop, capturing frames, detecting interface, applying Kalman filter,
+        and controlling motor to keep interface at target position while allowing manual keyboard nudges.
         """
         while self.running:
 
@@ -552,45 +613,59 @@ class InterfaceTracker(threading.Thread):
             # Rotate camera frame 180 degrees for correct orientation
             frame = cv2.rotate(frame, cv2.ROTATE_180)
 
+            # Use only the left half of the camera frame for tracking and display
+            frame = frame[:, :max(1, frame.shape[1] // 2)]
+
             row,confidence = detect_interface(frame)
-            if row is None or confidence < INTERFACE_CONF_THRESHOLD:
+            search_start, search_end = get_interface_search_bounds(frame.shape[0])
+            target_interface_mm = get_target_interface_mm(frame.shape[0])
+            fallback_row = 0.5 * (search_start + search_end - 1)
+            fallback_used = row is None or confidence < INTERFACE_CONF_THRESHOLD
+
+            if fallback_used:
+                row = fallback_row
                 self.lost_counter += 1
+                interface_source = "fallback_center"
             else:
                 self.lost_counter = 0
+                interface_source = "detected"
+
+            interface_mm = row * MM_PER_PIXEL
+
+            with state.lock:
+                manual_override_active = time.time() < state.manual_override_until
 
             # Normal Tracking Mode
-            if self.lost_counter == 0:
-                interface_mm = row * MM_PER_PIXEL
+            if not fallback_used:
                 height,velocity = self.kalman.update(interface_mm)
                 future = height + velocity * CAPTURE_INTERVAL
-                error = future - TARGET_INTERFACE_MM
-                steps = int(error * STEPS_PER_MM * 0.5)
-                # Only allow upward movement (positive steps)
-                if steps > 0 and abs(error) > 0.02:
-                    self.move_up_with_limit(steps)
-            # Short Loss (Prediction Hold)
+                error = future - target_interface_mm
+                steps = int((target_interface_mm - future) * STEPS_PER_MM * 0.5)
+                # Move up when the interface is above the middle line and backward when it is below.
+                if not manual_override_active and steps != 0 and abs(error) > 0.02:
+                    self.move_with_limit(steps)
+            # Short Loss (Prediction Hold while displaying the center-band fallback)
             elif self.lost_counter < 3:
-                interface_mm = 0
                 height,velocity = self.kalman.x.flatten()
                 predicted = height + velocity * CAPTURE_INTERVAL
-                error = predicted - TARGET_INTERFACE_MM
-                steps = int(error * STEPS_PER_MM * 0.3)
-                # Only allow upward movement (positive steps)
-                if steps > 0:
-                    self.move_up_with_limit(steps)
-            # Long Loss (Search Mode)
+                error = predicted - target_interface_mm
+                steps = int((target_interface_mm - predicted) * STEPS_PER_MM * 0.3)
+                if not manual_override_active and steps != 0:
+                    self.move_with_limit(steps)
+                height = interface_mm
+            # Long Loss: keep showing the search-band center.
             else:
-                print("Interface lost — searching")
-                interface_mm = 0
-                height, velocity = 0, 0
-                # For search mode, only search upwards within the travel limit
-                self.move_up_with_limit(self.search_step)
+                if not manual_override_active:
+                    print("Interface lost — using center of search band")
+                height, velocity = interface_mm, 0
 
             motor_pos = self.motor.get_position_mm()
 
             # Update motor status
-            if self.lost_counter >= 3:
-                motor_status = "searching"
+            if manual_override_active:
+                motor_status = "manual"
+            elif fallback_used:
+                motor_status = "fallback"
             else:
                 motor_status = "running"
 
@@ -598,6 +673,8 @@ class InterfaceTracker(threading.Thread):
 
                 state.interface_mm=interface_mm
                 state.interface_filtered=height
+                state.interface_fallback=fallback_used
+                state.interface_source=interface_source
                 state.growth_rate=velocity*60
                 state.motor_position_mm=motor_pos
                 state.motor_status=motor_status
@@ -654,6 +731,7 @@ class Logger(threading.Thread):
                     state.growth_rate,
                     state.motor_position_mm,
                     state.motor2_speed,
+                    state.interface_source,
                     state.motor_status
                 ]
 
@@ -693,6 +771,8 @@ class LiveDisplay(threading.Thread):
         self.temp3_hist=deque(maxlen=MAX_LENGTH_DISPLAY)
         self.temp4_hist=deque(maxlen=MAX_LENGTH_DISPLAY)
         self.interface_hist=deque(maxlen=MAX_LENGTH_DISPLAY)
+        self.interface_fallback_hist=deque(maxlen=MAX_LENGTH_DISPLAY)
+        self.motor_position_hist=deque(maxlen=MAX_LENGTH_DISPLAY)
         self.growth_hist=deque(maxlen=MAX_LENGTH_DISPLAY)
 
         self.history_deques = (
@@ -702,6 +782,8 @@ class LiveDisplay(threading.Thread):
             self.temp3_hist,
             self.temp4_hist,
             self.interface_hist,
+            self.interface_fallback_hist,
+            self.motor_position_hist,
             self.growth_hist,
         )
         self.history_lock = threading.Lock()
@@ -731,6 +813,8 @@ class LiveDisplay(threading.Thread):
                 "temp3": list(self.temp3_hist),
                 "temp4": list(self.temp4_hist),
                 "interface": list(self.interface_hist),
+                "interface_fallback": list(self.interface_fallback_hist),
+                "motor_position": list(self.motor_position_hist),
                 "growth": list(self.growth_hist),
             }
 
@@ -744,6 +828,8 @@ class LiveDisplay(threading.Thread):
 
                 temps=state.temperatures
                 i=state.interface_filtered
+                interface_fallback = state.interface_fallback
+                motor_pos = state.motor_position_mm
                 g=state.growth_rate
                 img=state.image
 
@@ -760,6 +846,8 @@ class LiveDisplay(threading.Thread):
                     self.temp3_hist.append(np.nan if padded_temps[2] is None else padded_temps[2])
                     self.temp4_hist.append(np.nan if padded_temps[3] is None else padded_temps[3])
                     self.interface_hist.append(np.nan if i is None else i)
+                    self.interface_fallback_hist.append(bool(interface_fallback))
+                    self.motor_position_hist.append(np.nan if motor_pos is None else motor_pos)
                     self.growth_hist.append(np.nan if g is None else g)
                     self._sync_history_lengths()
 
@@ -771,7 +859,7 @@ class DummyMotor:
     """
     A mock motor class for testing purposes when hardware is not available.
     """
-    def move_steps(self, steps, speed=1500):
+    def move_steps(self, steps, speed=200):
         """
         No-op method for moving steps (does nothing).
 
@@ -788,6 +876,45 @@ class DummyMotor:
             float: Always 0.0.
         """
         return 0.0
+
+
+def move_motor1_manual(motor, requested_steps, speed=MOTOR1_MANUAL_SPEED):
+    """
+    Manually nudge the primary motor from the keyboard while respecting travel limits.
+    """
+    if not isinstance(motor, ArduinoStepper) or requested_steps == 0:
+        return
+
+    current_pos_mm = motor.get_position_mm()
+
+    if requested_steps > 0:
+        max_allowed_steps = max(0, int((MAX_TRAVEL_MM - current_pos_mm) * STEPS_PER_MM))
+        limited_steps = min(requested_steps, max_allowed_steps)
+    else:
+        max_allowed_steps = max(0, int(current_pos_mm * STEPS_PER_MM))
+        limited_steps = -min(abs(requested_steps), max_allowed_steps)
+
+    if limited_steps == 0:
+        print("Motor1 limit reached; manual move ignored")
+        return
+
+    with state.lock:
+        state.manual_override_until = time.time() + MANUAL_OVERRIDE_DURATION
+
+    try:
+        motor.move_steps(limited_steps, speed=speed)
+    except Exception as e:
+        print(f"Warning: failed to move motor1: {e}")
+        return
+
+    new_pos_mm = motor.get_position_mm()
+    direction = "up" if limited_steps > 0 else "down"
+
+    with state.lock:
+        state.motor_position_mm = new_pos_mm
+        state.motor_status = "manual"
+
+    print(f"Motor1 moved {direction}: {limited_steps} steps ({new_pos_mm:.2f} mm)")
 
 
 def update_motor2_speed(motor, new_speed):
@@ -891,6 +1018,7 @@ def main():
     else:
         motor = ArduinoStepper()
         print(f"Motor2 start: speed={MOTOR2_SPEED} steps/s")
+        print(f"Motor1 controls: 'w'/'s' or up/down arrows move ±{MOTOR1_MANUAL_STEP_MM:.2f} mm")
         print("Motor2 controls: '[' slower | ']' faster | '0' stop")
         motor.start_motor2(MOTOR2_SPEED)
 
@@ -930,7 +1058,24 @@ def main():
                 ax.clear()
                 ax_twin.clear()
                 if time_data:
-                    ax.plot(time_data, plot_data["interface"], label="Interface mm", color='blue')
+                    interface_data = plot_data["interface"]
+                    fallback_flags = plot_data["interface_fallback"]
+                    detected_interface = [
+                        value if not fallback else np.nan
+                        for value, fallback in zip(interface_data, fallback_flags)
+                    ]
+                    fallback_interface = [
+                        motor_pos if fallback else np.nan
+                        for motor_pos, fallback in zip(plot_data["motor_position"], fallback_flags)
+                    ]
+
+                    if any(not np.isnan(value) for value in detected_interface):
+                        ax.plot(time_data, detected_interface, label="Interface mm", color='blue')
+                    if any(not np.isnan(value) for value in fallback_interface):
+                        ax.plot(time_data, fallback_interface, label="Fallback center", color='orange', marker='o', linestyle='None', markersize=4)
+                    handles, labels = ax.get_legend_handles_labels()
+                    if handles:
+                        ax.legend(loc='upper left')
                 ax.set_xlabel('Time (min)')
                 ax.set_ylabel('Interface (mm)', color='blue')
                 ax.tick_params(axis='y', labelcolor='blue')
@@ -969,26 +1114,57 @@ def main():
                 with state.lock:
                     img = state.image
                     interface_mm = state.interface_mm
+                    interface_fallback = state.interface_fallback
 
                 if img is not None:
                     with state.lock:
                         motor2_speed = state.motor2_speed
 
-                    row = int((interface_mm or 0) / MM_PER_PIXEL)
                     annotated = img.copy()
-                    cv2.line(annotated, (0, row), (IMAGE_WIDTH, row), (0, 0, 255), 2)
+                    img_height, img_width = annotated.shape[:2]
+                    search_start, search_end = get_interface_search_bounds(img_height)
+
+                    overlay = annotated.copy()
+                    cv2.rectangle(overlay, (0, search_start), (img_width - 1, search_end - 1), (255, 255, 0), -1)
+                    cv2.addWeighted(overlay, 0.12, annotated, 0.88, 0, annotated)
+                    cv2.rectangle(annotated, (0, search_start), (img_width - 1, search_end - 1), (255, 255, 0), 1)
+
+                    if interface_mm is not None and interface_mm > 0:
+                        row = int(round(interface_mm / MM_PER_PIXEL))
+                        row = max(0, min(img_height - 1, row))
+                        line_color = (0, 165, 255) if interface_fallback else (0, 0, 255)
+                        cv2.line(annotated, (0, row), (img_width, row), line_color, 2)
+
                     cv2.putText(annotated, f"Motor2: {motor2_speed} steps/s", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                    cv2.putText(annotated, "Controls: [ slower | ] faster | 0 stop", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                    cv2.putText(annotated, f"Motor1: W/S or arrows move ±{MOTOR1_MANUAL_STEP_MM:.2f} mm", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                    cv2.putText(annotated, "Motor2: [ slower | ] faster | 0 stop", (10, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                    cv2.putText(annotated, f"Search band: center {search_end - search_start}px", (10, 94), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                    cv2.putText(annotated, "View: left half only", (10, 116), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    status_text = "Interface: manually" if interface_fallback else "Interface: detected"
+                    status_color = (0, 165, 255) if interface_fallback else (0, 255, 0)
+                    cv2.putText(annotated, status_text, (10, 138), cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1)
                     cv2.imshow("Interface", annotated)
 
-                key = cv2.waitKey(1) & 0xFF
-                if not args.no_motor and isinstance(motor, ArduinoStepper):
-                    if key in (ord(']'), ord('='), ord('+')):
-                        update_motor2_speed(motor, MOTOR2_SPEED + MOTOR2_SPEED_STEP)
-                    elif key in (ord('['), ord('-'), ord('_')):
-                        update_motor2_speed(motor, max(0, MOTOR2_SPEED - MOTOR2_SPEED_STEP))
-                    elif key == ord('0'):
-                        update_motor2_speed(motor, 0)
+            key = cv2.waitKeyEx(1)
+            if not args.no_motor and isinstance(motor, ArduinoStepper):
+                motor1_step = max(1, int(round(MOTOR1_MANUAL_STEP_MM * STEPS_PER_MM)))
+
+                if key in (ord('w'), ord('W'), 82, 2490368, 65362):
+                    move_motor1_manual(motor, motor1_step)
+                elif key in (ord('s'), ord('S'), 84, 2621440, 65364):
+                    move_motor1_manual(motor, -motor1_step)
+                elif key in (ord(']'), ord('='), ord('+')):
+                    update_motor2_speed(motor, MOTOR2_SPEED + MOTOR2_SPEED_STEP)
+                elif key in (ord('['), ord('-'), ord('_')):
+                    update_motor2_speed(motor, max(0, MOTOR2_SPEED - MOTOR2_SPEED_STEP))
+                elif key == ord('1'):
+                    update_motor2_speed(motor, MOTOR2_SPEED_MIN)
+                elif key == ord('2'):
+                    update_motor2_speed(motor, MOTOR2_SPEED_MAX)
+                elif key == ord('3'):
+                    update_motor2_speed(motor, MOTOR2_SPEED_AVG)
+                elif key == ord('0'):
+                    update_motor2_speed(motor, 0)
 
             time.sleep(DISPLAY_INTERVAL)
     except KeyboardInterrupt:
