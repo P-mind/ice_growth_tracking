@@ -531,6 +531,39 @@ def detect_upper_interface(frame, min_distance=20, height_threshold=0.3):
     
     return upper_interface[0], upper_interface[1]
 
+
+def build_interface_filtered_view(frame, interface_mm=None, interface_fallback=False):
+    """
+    Build a visualization of the filtered image used for interface extraction.
+
+    The view is based on the vertical Sobel gradient magnitude so the detected
+    interface appears as a bright horizontal feature.
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    sobel = cv2.Sobel(blur, cv2.CV_64F, 0, 1, ksize=3)
+    gradient = np.abs(sobel)
+    gradient_u8 = cv2.normalize(gradient, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    filtered_view = cv2.cvtColor(gradient_u8, cv2.COLOR_GRAY2BGR)
+
+    img_height, img_width = filtered_view.shape[:2]
+    search_start, search_end = get_interface_search_bounds(img_height)
+
+    overlay = filtered_view.copy()
+    cv2.rectangle(overlay, (0, search_start), (img_width - 1, search_end - 1), (255, 255, 0), -1)
+    cv2.addWeighted(overlay, 0.12, filtered_view, 0.88, 0, filtered_view)
+    cv2.rectangle(filtered_view, (0, search_start), (img_width - 1, search_end - 1), (255, 255, 0), 1)
+
+    if interface_mm is not None and interface_mm > 0:
+        row = int(round(interface_mm / MM_PER_PIXEL))
+        row = max(0, min(img_height - 1, row))
+        line_color = (0, 165, 255) if interface_fallback else (0, 255, 0)
+        cv2.line(filtered_view, (0, row), (img_width - 1, row), line_color, 2)
+
+    cv2.putText(filtered_view, "Filtered: Sobel |dI/dy|", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+    return filtered_view
+
 ########################################
 # INTERFACE TRACKING
 ########################################
@@ -566,6 +599,7 @@ class InterfaceTracker(threading.Thread):
         # Recovery Variables
         self.lost_counter = 0
         self.search_step = int(STEPS_PER_MM * 0.1)
+        self.last_detected_interface_mm = None
 
     def move_with_limit(self, steps, speed=200):
         """
@@ -614,23 +648,28 @@ class InterfaceTracker(threading.Thread):
             frame = cv2.rotate(frame, cv2.ROTATE_180)
 
             # Use only the left half of the camera frame for tracking and display
-            frame = frame[:, :max(1, frame.shape[1] // 2)]
+          #  frame = frame[:, :max(1, frame.shape[1] // 2)]
 
             row,confidence = detect_interface(frame)
             search_start, search_end = get_interface_search_bounds(frame.shape[0])
             target_interface_mm = get_target_interface_mm(frame.shape[0])
             fallback_row = 0.5 * (search_start + search_end - 1)
+            fallback_mm = fallback_row * MM_PER_PIXEL
             fallback_used = row is None or confidence < INTERFACE_CONF_THRESHOLD
 
             if fallback_used:
-                row = fallback_row
                 self.lost_counter += 1
-                interface_source = "fallback_center"
+                if self.last_detected_interface_mm is not None:
+                    interface_mm = self.last_detected_interface_mm
+                    interface_source = "fallback_last_detected"
+                else:
+                    interface_mm = fallback_mm
+                    interface_source = "fallback_center"
             else:
                 self.lost_counter = 0
+                interface_mm = row * MM_PER_PIXEL
+                self.last_detected_interface_mm = interface_mm
                 interface_source = "detected"
-
-            interface_mm = row * MM_PER_PIXEL
 
             with state.lock:
                 manual_override_active = time.time() < state.manual_override_until
@@ -880,41 +919,30 @@ class DummyMotor:
 
 def move_motor1_manual(motor, requested_steps, speed=MOTOR1_MANUAL_SPEED):
     """
-    Manually nudge the primary motor from the keyboard while respecting travel limits.
+    Manually nudge the primary motor from the keyboard without applying travel limits.
     """
     if not isinstance(motor, ArduinoStepper) or requested_steps == 0:
         return
 
-    current_pos_mm = motor.get_position_mm()
-
-    if requested_steps > 0:
-        max_allowed_steps = max(0, int((MAX_TRAVEL_MM - current_pos_mm) * STEPS_PER_MM))
-        limited_steps = min(requested_steps, max_allowed_steps)
-    else:
-        max_allowed_steps = max(0, int(current_pos_mm * STEPS_PER_MM))
-        limited_steps = -min(abs(requested_steps), max_allowed_steps)
-
-    if limited_steps == 0:
-        print("Motor1 limit reached; manual move ignored")
-        return
+    manual_steps = int(requested_steps)
 
     with state.lock:
         state.manual_override_until = time.time() + MANUAL_OVERRIDE_DURATION
 
     try:
-        motor.move_steps(limited_steps, speed=speed)
+        motor.move_steps(manual_steps, speed=speed)
     except Exception as e:
         print(f"Warning: failed to move motor1: {e}")
         return
 
     new_pos_mm = motor.get_position_mm()
-    direction = "up" if limited_steps > 0 else "down"
+    direction = "up" if manual_steps > 0 else "down"
 
     with state.lock:
         state.motor_position_mm = new_pos_mm
         state.motor_status = "manual"
 
-    print(f"Motor1 moved {direction}: {limited_steps} steps ({new_pos_mm:.2f} mm)")
+    print(f"Motor1 moved {direction}: {manual_steps} steps ({new_pos_mm:.2f} mm)")
 
 
 def update_motor2_speed(motor, new_speed):
@@ -1072,7 +1100,7 @@ def main():
                     if any(not np.isnan(value) for value in detected_interface):
                         ax.plot(time_data, detected_interface, label="Interface mm", color='blue')
                     if any(not np.isnan(value) for value in fallback_interface):
-                        ax.plot(time_data, fallback_interface, label="Fallback center", color='orange', marker='o', linestyle='None', markersize=4)
+                        ax.plot(time_data, fallback_interface, label="Fallback center", color='lightblue')
                     handles, labels = ax.get_legend_handles_labels()
                     if handles:
                         ax.legend(loc='upper left')
@@ -1143,7 +1171,15 @@ def main():
                     status_text = "Interface: manually" if interface_fallback else "Interface: detected"
                     status_color = (0, 165, 255) if interface_fallback else (0, 255, 0)
                     cv2.putText(annotated, status_text, (10, 138), cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1)
-                    cv2.imshow("Interface", annotated)
+
+                    filtered_view = build_interface_filtered_view(
+                        img,
+                        interface_mm=interface_mm,
+                        interface_fallback=interface_fallback,
+                    )
+
+                    combined_view = np.hstack((annotated, filtered_view))
+                    cv2.imshow("Interface (Live + Filtered)", combined_view)
 
             key = cv2.waitKeyEx(1)
             if not args.no_motor and isinstance(motor, ArduinoStepper):
