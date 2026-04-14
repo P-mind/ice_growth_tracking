@@ -735,6 +735,10 @@ class InterfaceTracker(threading.Thread):
             fallback_mm = fallback_row * MM_PER_PIXEL
             fallback_used = row is None or confidence < INTERFACE_CONF_THRESHOLD
 
+            if row is not None:
+                # Keep the latest measurable interface position so fallback can hold it.
+                self.last_detected_interface_mm = row * MM_PER_PIXEL
+
             if fallback_used:
                 self.lost_counter += 1
                 if self.last_detected_interface_mm is not None:
@@ -1284,14 +1288,14 @@ def main():
                         for value, fallback in zip(interface_data, fallback_flags)
                     ]
                     fallback_interface = [
-                        motor_pos if fallback else np.nan
-                        for motor_pos, fallback in zip(plot_data["motor_position"], fallback_flags)
+                        value if fallback else np.nan
+                        for value, fallback in zip(interface_data, fallback_flags)
                     ]
 
                     if any(not np.isnan(value) for value in detected_interface):
                         ax.plot(time_data, detected_interface, label="Interface mm", color='blue')
                     if any(not np.isnan(value) for value in fallback_interface):
-                        ax.plot(time_data, fallback_interface, label="Fallback center", color='lightblue')
+                        ax.plot(time_data, fallback_interface, label="Fallback last detected", color='lightblue')
                     handles, labels = ax.get_legend_handles_labels()
                     if handles:
                         ax.legend(loc='upper left')
@@ -1358,7 +1362,7 @@ def main():
                 cv2.putText(annotated, "Motor2: [ slower | ] faster | 0 stop", (10, 94), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                 cv2.putText(annotated, f"Search band: center {search_end - search_start}px", (10, 116), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
                 cv2.putText(annotated, "View: left half only", (10, 138), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                status_text = "Interface: manually" if interface_fallback else "Interface: detected"
+                status_text = "Interface: fallback (last detected)" if interface_fallback else "Interface: detected"
                 status_color = (0, 165, 255) if interface_fallback else (0, 255, 0)
                 cv2.putText(annotated, status_text, (10, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1)
 
