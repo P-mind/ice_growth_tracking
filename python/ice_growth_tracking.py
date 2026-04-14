@@ -88,6 +88,7 @@ CAPTURE_INTERVAL = 0.5 #1.0
 LOG_INTERVAL = 1.0
 FLUSH_INTERVAL = 20
 DISPLAY_INTERVAL = 0.5
+PLOT_UPDATE_INTERVAL = 1.0
 
 TARGET_INTERFACE_MM = 0.05  # None keeps the detected interface centered in the frame
 INTERFACE_CONF_THRESHOLD = 5.0  # Pixel
@@ -105,7 +106,18 @@ MOTOR2_SPEED_AVG = 10000
 
 MOTOR1_MANUAL_STEP_MM = 0.25   # Manual nudge per keypress for motor 1
 MOTOR1_MANUAL_SPEED = 400     # Speed for manual motor 1 nudges in steps/sec
+MOTOR1_TRACK_SPEED = 120      # Slower speed for automatic tracking moves in steps/sec
+MOTOR1_TRACK_GAIN = 0.2       # Position correction gain for automatic tracking
+MOTOR1_LOST_GAIN = 0.1        # Smaller gain while running on prediction fallback
+MOTOR1_MAX_STEP_PER_CYCLE = 12  # Limit tracking correction per capture cycle (steps)
+MOTOR1_ACCEL_INIT = 600       # Motor 1 acceleration in steps/s^2
+MOTOR1_ACCEL_STEP = 100       # Live adjustment step for motor 1 acceleration
+MOTOR1_ACCEL_MIN = 50
+MOTOR1_ACCEL_MAX = 5000
 MANUAL_OVERRIDE_DURATION = 5.0 # Seconds to pause auto-tracking after a manual nudge
+
+SERIAL_CMD_TIMEOUT_S = 3.0
+SERIAL_MAX_RESPONSE_LINES = 12
 
 MM_PER_PIXEL = 0.02
 STEPS_PER_MM = 400
@@ -187,9 +199,52 @@ class ArduinoStepper:
         self.ser = serial.Serial(SERIAL_PORT,115200,timeout=2)
         time.sleep(2)
 
+        # Clear boot-time banners/noise so command parsing starts from a clean buffer.
+        self.ser.reset_input_buffer()
+        self.ser.reset_output_buffer()
+
         self.position_steps = 0
         self.lock = threading.Lock()
         self.command_lock = threading.Lock()
+
+    def _send_command_wait_reply(self, cmd, expected_prefixes, timeout_s=SERIAL_CMD_TIMEOUT_S):
+        """
+        Send a single command and consume serial lines until one matches expected prefixes.
+
+        This protects against occasional startup banners or noisy lines that can appear
+        before the real protocol response.
+        """
+        expected_prefixes = tuple(expected_prefixes)
+        deadline = time.time() + timeout_s
+        unexpected_lines = []
+
+        with self.command_lock:
+            self.ser.reset_input_buffer()
+            self.ser.write(cmd.encode())
+            self.ser.flush()
+
+            lines_seen = 0
+            while time.time() < deadline and lines_seen < SERIAL_MAX_RESPONSE_LINES:
+                raw = self.ser.readline()
+                if not raw:
+                    continue
+
+                lines_seen += 1
+                line = raw.decode(errors="replace").strip()
+                if not line:
+                    continue
+
+                if line.lower().endswith("ready"):
+                    continue
+
+                if any(line.startswith(prefix) for prefix in expected_prefixes):
+                    return line
+
+                unexpected_lines.append(line)
+
+        detail = unexpected_lines[-1] if unexpected_lines else "timeout/no response"
+        expected_text = " or ".join(expected_prefixes)
+        raise RuntimeError(f"Expected '{expected_text}', got '{detail}'")
 
     def move_steps(self,steps,speed=200):
         """
@@ -200,20 +255,15 @@ class ArduinoStepper:
             speed (int, optional): Speed of movement in steps per second (default: 1500).
         """
         cmd=f"MOVE {steps} {speed}\n"
+        line = self._send_command_wait_reply(cmd, ("POS",))
 
-        with self.command_lock:
-            self.ser.write(cmd.encode())
-            line=self.ser.readline().decode().strip()
-
-        if line.startswith("POS"):
-
+        try:
             pos=int(line.split()[1])
+        except (IndexError, ValueError) as e:
+            raise RuntimeError(f"Failed to parse motor position from: {line}") from e
 
-            with self.lock:
-                self.position_steps=pos
-            return
-
-        raise RuntimeError(f"Failed to move motor: {line}")
+        with self.lock:
+            self.position_steps=pos
 
     def move_steps2(self, steps, speed=400):
         """
@@ -224,9 +274,7 @@ class ArduinoStepper:
             speed (int, optional): Speed in steps per second.
         """
         cmd=f"MOVE2 {steps} {speed}\n"
-        with self.command_lock:
-            self.ser.write(cmd.encode())
-            line=self.ser.readline().decode().strip()
+        line = self._send_command_wait_reply(cmd, ("POS2",))
         if line.startswith("POS2"):
             return int(line.split()[1])
         raise RuntimeError(f"Failed to move motor2: {line}")
@@ -236,9 +284,7 @@ class ArduinoStepper:
         Starts the secondary motor continuously at the requested speed in steps/sec.
         """
         cmd=f"START2 {speed}\n"
-        with self.command_lock:
-            self.ser.write(cmd.encode())
-            line=self.ser.readline().decode().strip()
+        line = self._send_command_wait_reply(cmd, ("START2 OK",))
         if not line.startswith("START2 OK"):
             raise RuntimeError(f"Failed to start motor2: {line}")
 
@@ -248,13 +294,21 @@ class ArduinoStepper:
         """
         self.start_motor2(speed)
 
+    def set_motor1_accel(self, accel_steps_s2):
+        """
+        Updates motor 1 acceleration in steps/s^2.
+        """
+        accel_steps_s2 = int(accel_steps_s2)
+        cmd = f"ACCEL1 {accel_steps_s2}\n"
+        line = self._send_command_wait_reply(cmd, ("ACCEL1 OK",))
+        if not line.startswith("ACCEL1 OK"):
+            raise RuntimeError(f"Failed to set motor1 acceleration: {line}")
+
     def stop_motor2(self):
         """
         Stops the secondary motor.
         """
-        with self.command_lock:
-            self.ser.write(b"STOP2\n")
-            line=self.ser.readline().decode().strip()
+        line = self._send_command_wait_reply("STOP2\n", ("STOP2 OK",))
         if not line.startswith("STOP2 OK"):
             raise RuntimeError(f"Failed to stop motor2: {line}")
 
@@ -262,9 +316,7 @@ class ArduinoStepper:
         """
         Resets the system state (can be used to clear motor stopped flags).
         """
-        with self.command_lock:
-            self.ser.write(b"RESET\n")
-            line=self.ser.readline().decode().strip()
+        line = self._send_command_wait_reply("RESET\n", ("RESET OK",))
         if not line.startswith("RESET OK"):
             raise RuntimeError(f"Failed to reset system: {line}")
 
@@ -570,7 +622,7 @@ def build_interface_filtered_view(frame, interface_mm=None, interface_fallback=F
 
 class InterfaceTracker(threading.Thread):
 
-    def __init__(self,motor):
+    def __init__(self,motor,motor_worker=None):
         """
         Initializes the InterfaceTracker class, a threading class that tracks the interface using camera and motor.
 
@@ -588,6 +640,7 @@ class InterfaceTracker(threading.Thread):
         super().__init__()
 
         self.motor=motor
+        self.motor_worker = motor_worker
         self.running=True
 
         self.kalman=InterfaceKalman(dt=CAPTURE_INTERVAL)
@@ -595,11 +648,23 @@ class InterfaceTracker(threading.Thread):
         self.cap=cv2.VideoCapture(CAMERA_INDEX)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,IMAGE_WIDTH)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT,IMAGE_HEIGHT)
+        # Keep camera buffering minimal to reduce display lag.
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         # Recovery Variables
         self.lost_counter = 0
         self.search_step = int(STEPS_PER_MM * 0.1)
         self.last_detected_interface_mm = None
+
+    @staticmethod
+    def _limited_tracking_steps(error_mm, gain, max_step_per_cycle):
+        """
+        Convert tracking error to a bounded step command so motor motion stays smooth.
+        """
+        raw_steps = int((-error_mm) * STEPS_PER_MM * gain)
+        if raw_steps == 0:
+            return 0
+        return int(np.clip(raw_steps, -max_step_per_cycle, max_step_per_cycle))
 
     def move_with_limit(self, steps, speed=200):
         """
@@ -629,14 +694,27 @@ class InterfaceTracker(threading.Thread):
             max_allowed_steps = int(available_mm * STEPS_PER_MM)
             limited_steps = -min(abs(steps), max_allowed_steps)
 
-        if limited_steps != 0:
+        if limited_steps == 0:
+            return
+
+        if self.motor_worker is not None:
+            self.motor_worker.request_move(limited_steps, speed=speed)
+            return
+
+        try:
             self.motor.move_steps(limited_steps, speed=speed)
+        except Exception as e:
+            with state.lock:
+                state.motor_status = "fallback"
+            print(f"Warning: failed to move motor1: {e}")
 
     def run(self):
         """
         Runs the interface tracking loop, capturing frames, detecting interface, applying Kalman filter,
         and controlling motor to keep interface at target position while allowing manual keyboard nudges.
         """
+        next_capture = time.perf_counter()
+
         while self.running:
 
             ret,frame=self.cap.read()
@@ -679,18 +757,26 @@ class InterfaceTracker(threading.Thread):
                 height,velocity = self.kalman.update(interface_mm)
                 future = height + velocity * CAPTURE_INTERVAL
                 error = future - target_interface_mm
-                steps = int((target_interface_mm - future) * STEPS_PER_MM * 0.5)
+                steps = self._limited_tracking_steps(
+                    error_mm=error,
+                    gain=MOTOR1_TRACK_GAIN,
+                    max_step_per_cycle=MOTOR1_MAX_STEP_PER_CYCLE,
+                )
                 # Move up when the interface is above the middle line and backward when it is below.
                 if not manual_override_active and steps != 0 and abs(error) > 0.02:
-                    self.move_with_limit(steps)
+                    self.move_with_limit(steps, speed=MOTOR1_TRACK_SPEED)
             # Short Loss (Prediction Hold while displaying the center-band fallback)
             elif self.lost_counter < 3:
                 height,velocity = self.kalman.x.flatten()
                 predicted = height + velocity * CAPTURE_INTERVAL
                 error = predicted - target_interface_mm
-                steps = int((target_interface_mm - predicted) * STEPS_PER_MM * 0.3)
+                steps = self._limited_tracking_steps(
+                    error_mm=error,
+                    gain=MOTOR1_LOST_GAIN,
+                    max_step_per_cycle=max(1, MOTOR1_MAX_STEP_PER_CYCLE // 2),
+                )
                 if not manual_override_active and steps != 0:
-                    self.move_with_limit(steps)
+                    self.move_with_limit(steps, speed=MOTOR1_TRACK_SPEED)
                 height = interface_mm
             # Long Loss: keep showing the search-band center.
             else:
@@ -719,7 +805,13 @@ class InterfaceTracker(threading.Thread):
                 state.motor_status=motor_status
                 state.image=frame
 
-            time.sleep(CAPTURE_INTERVAL)
+            next_capture += CAPTURE_INTERVAL
+            sleep_s = next_capture - time.perf_counter()
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+            else:
+                # If processing overruns, resync without accumulating additional delay.
+                next_capture = time.perf_counter()
 
 ########################################
 # LOGGER
@@ -917,6 +1009,79 @@ class DummyMotor:
         return 0.0
 
 
+class MotorMoveWorker(threading.Thread):
+    """
+    Executes motor1 move commands on a dedicated thread.
+
+    The worker stores only the most recent requested move to avoid command backlog
+    when vision updates are faster than motor execution.
+    """
+    def __init__(self, motor):
+        super().__init__()
+        self.motor = motor
+        self.running = True
+        self.command_lock = threading.Lock()
+        self.new_command = threading.Event()
+        self.pending_command = None
+
+    def request_move(self, steps, speed):
+        with self.command_lock:
+            self.pending_command = (int(steps), int(speed))
+            self.new_command.set()
+
+    @staticmethod
+    def _apply_travel_limit(current_pos_mm, steps):
+        if steps == 0:
+            return 0
+
+        if steps > 0:
+            remaining_mm = MAX_TRAVEL_MM - current_pos_mm
+            if remaining_mm <= 0:
+                return 0
+            max_allowed_steps = int(remaining_mm * STEPS_PER_MM)
+            return min(steps, max_allowed_steps)
+
+        available_mm = max(0.0, current_pos_mm)
+        if available_mm <= 0:
+            return 0
+        max_allowed_steps = int(available_mm * STEPS_PER_MM)
+        return -min(abs(steps), max_allowed_steps)
+
+    def stop(self):
+        self.running = False
+        self.new_command.set()
+
+    def run(self):
+        while self.running:
+            self.new_command.wait(timeout=0.2)
+            if not self.running:
+                break
+
+            with self.command_lock:
+                cmd = self.pending_command
+                self.pending_command = None
+                self.new_command.clear()
+
+            if cmd is None:
+                continue
+
+            requested_steps, speed = cmd
+
+            current_pos_mm = self.motor.get_position_mm()
+            limited_steps = self._apply_travel_limit(current_pos_mm, requested_steps)
+            if limited_steps == 0:
+                continue
+
+            try:
+                self.motor.move_steps(limited_steps, speed=speed)
+                with state.lock:
+                    state.motor_position_mm = self.motor.get_position_mm()
+            except Exception as e:
+                with state.lock:
+                    state.motor_status = "fallback"
+                print(f"Warning: failed to move motor1: {e}")
+
+
 def move_motor1_manual(motor, requested_steps, speed=MOTOR1_MANUAL_SPEED):
     """
     Manually nudge the primary motor from the keyboard without applying travel limits.
@@ -970,6 +1135,25 @@ def update_motor2_speed(motor, new_speed):
     else:
         print(f"Motor2 speed updated to {MOTOR2_SPEED} steps/s")
 
+
+def update_motor1_accel(motor, new_accel):
+    """
+    Updates the primary motor acceleration while the experiment is running.
+    """
+    global MOTOR1_ACCEL
+
+    new_accel = max(MOTOR1_ACCEL_MIN, min(MOTOR1_ACCEL_MAX, int(new_accel)))
+
+    try:
+        if isinstance(motor, ArduinoStepper):
+            motor.set_motor1_accel(new_accel)
+    except Exception as e:
+        print(f"Warning: failed to update motor1 acceleration: {e}")
+        return
+
+    MOTOR1_ACCEL = new_accel
+    print(f"Motor1 acceleration updated to {MOTOR1_ACCEL} steps/s^2")
+
 ########################################
 # MAIN
 ########################################
@@ -980,15 +1164,18 @@ def main():
     (motor, temperature sensor), starts background threads for tracking, logging, display, and temperature reading. 
     Runs an infinite loop until interrupted, then gracefully stops all threads.
     """
+    global CAPTURE_INTERVAL, DISPLAY_INTERVAL, IMAGE_WIDTH, IMAGE_HEIGHT, MOTOR1_ACCEL, MOTOR2_SPEED
+
     parser = argparse.ArgumentParser(description="Ice Growth Tracking System")
     parser.add_argument('--no-motor', action='store_true', help='Disable motor control')
     parser.add_argument('--no-logger', action='store_true', help='Disable logging')
     parser.add_argument('--test-camera', action='store_true', help='Test camera and display only (disables motor, logger)')
     parser.add_argument('--test-temperature', action='store_true', help='Test temperature sensors only and print readings')
-    parser.add_argument('--capture-interval', type=float, default=1.0, help='Capture interval in seconds (default: 1.0)')
-    parser.add_argument('--display-interval', type=float, default=0.5, help='Display update interval in seconds (default: 0.5)')
+    parser.add_argument('--capture-interval', type=float, default=CAPTURE_INTERVAL, help=f'Capture interval in seconds (default: {CAPTURE_INTERVAL})')
+    parser.add_argument('--display-interval', type=float, default=DISPLAY_INTERVAL, help=f'Display update interval in seconds (default: {DISPLAY_INTERVAL})')
     parser.add_argument('--image-width', type=int, default=640, help='Camera image width (default: 640)')
     parser.add_argument('--image-height', type=int, default=480, help='Camera image height (default: 480)')
+    parser.add_argument('--motor1-accel', type=int, default=MOTOR1_ACCEL_INIT, help='Motor 1 acceleration in steps/s^2')
     parser.add_argument('--motor2-speed', type=int, default=MOTOR2_SPEED_INIT, help='Initial speed for the secondary motor in steps/sec')
     parser.add_argument('--test-arduino', action='store_true', help='Test Arduino serial communication and exit')
 
@@ -1027,15 +1214,11 @@ def main():
         sys.exit(0)
 
     # Update global config
-    global CAPTURE_INTERVAL
-    CAPTURE_INTERVAL = args.capture_interval
-    global DISPLAY_INTERVAL
-    DISPLAY_INTERVAL = args.display_interval
-    global IMAGE_WIDTH
-    IMAGE_WIDTH = args.image_width
-    global IMAGE_HEIGHT
-    IMAGE_HEIGHT = args.image_height
-    global MOTOR2_SPEED
+    # CAPTURE_INTERVAL = args.capture_interval
+    # DISPLAY_INTERVAL = args.display_interval
+    # IMAGE_WIDTH = args.image_width
+    # IMAGE_HEIGHT = args.image_height
+    MOTOR1_ACCEL = max(MOTOR1_ACCEL_MIN, min(MOTOR1_ACCEL_MAX, int(MOTOR1_ACCEL_INIT)))
     MOTOR2_SPEED = MOTOR2_SPEED_INIT
 
     with state.lock:
@@ -1043,14 +1226,20 @@ def main():
 
     if args.no_motor:
         motor = DummyMotor()
+        motor_worker = None
     else:
         motor = ArduinoStepper()
+        motor_worker = MotorMoveWorker(motor)
+        motor_worker.start()
+        update_motor1_accel(motor, MOTOR1_ACCEL)
+        print(f"Motor1 acceleration: {MOTOR1_ACCEL} steps/s^2")
         print(f"Motor2 start: speed={MOTOR2_SPEED} steps/s")
         print(f"Motor1 controls: 'w'/'s' or up/down arrows move ±{MOTOR1_MANUAL_STEP_MM:.2f} mm")
+        print("Motor1 accel: ',' slower | '.' faster")
         print("Motor2 controls: '[' slower | ']' faster | '0' stop")
         motor.start_motor2(MOTOR2_SPEED)
 
-    tracker = InterfaceTracker(motor)
+    tracker = InterfaceTracker(motor, motor_worker=motor_worker)
     display = LiveDisplay()
 
     threads = [display, tracker]
@@ -1069,6 +1258,7 @@ def main():
     fig2, ax2 = plt.subplots()
     ax_twin = ax.twinx()
     ax2_twin = ax2.twinx()
+    last_plot_update = 0.0
 
     for thread in threads:
         thread.start()
@@ -1076,8 +1266,9 @@ def main():
     try:
         while True:
             # Handle display updates on main thread
-            if display.new_data.is_set():
+            if display.new_data.is_set() and (time.time() - last_plot_update >= PLOT_UPDATE_INTERVAL):
                 display.new_data.clear()
+                last_plot_update = time.time()
 
                 plot_data = display.get_plot_data()
                 time_data = plot_data["time"]
@@ -1138,48 +1329,47 @@ def main():
                 plt.figure(fig2.number)  # Switch to temperature figure
                 plt.pause(0.01)
 
-                # Handle camera display
-                with state.lock:
-                    img = state.image
-                    interface_mm = state.interface_mm
-                    interface_fallback = state.interface_fallback
+            # Keep camera display responsive even when plot updates are throttled.
+            with state.lock:
+                img = state.image
+                interface_mm = state.interface_mm
+                interface_fallback = state.interface_fallback
+                motor2_speed = state.motor2_speed
 
-                if img is not None:
-                    with state.lock:
-                        motor2_speed = state.motor2_speed
+            if img is not None:
+                annotated = img.copy()
+                img_height, img_width = annotated.shape[:2]
+                search_start, search_end = get_interface_search_bounds(img_height)
 
-                    annotated = img.copy()
-                    img_height, img_width = annotated.shape[:2]
-                    search_start, search_end = get_interface_search_bounds(img_height)
+                overlay = annotated.copy()
+                cv2.rectangle(overlay, (0, search_start), (img_width - 1, search_end - 1), (255, 255, 0), -1)
+                cv2.addWeighted(overlay, 0.12, annotated, 0.88, 0, annotated)
+                cv2.rectangle(annotated, (0, search_start), (img_width - 1, search_end - 1), (255, 255, 0), 1)
 
-                    overlay = annotated.copy()
-                    cv2.rectangle(overlay, (0, search_start), (img_width - 1, search_end - 1), (255, 255, 0), -1)
-                    cv2.addWeighted(overlay, 0.12, annotated, 0.88, 0, annotated)
-                    cv2.rectangle(annotated, (0, search_start), (img_width - 1, search_end - 1), (255, 255, 0), 1)
+                if interface_mm is not None and interface_mm > 0:
+                    row = int(round(interface_mm / MM_PER_PIXEL))
+                    row = max(0, min(img_height - 1, row))
+                    line_color = (0, 165, 255) if interface_fallback else (0, 0, 255)
+                    cv2.line(annotated, (0, row), (img_width, row), line_color, 2)
 
-                    if interface_mm is not None and interface_mm > 0:
-                        row = int(round(interface_mm / MM_PER_PIXEL))
-                        row = max(0, min(img_height - 1, row))
-                        line_color = (0, 165, 255) if interface_fallback else (0, 0, 255)
-                        cv2.line(annotated, (0, row), (img_width, row), line_color, 2)
+                cv2.putText(annotated, f"Motor2: {motor2_speed} steps/s", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                cv2.putText(annotated, f"Motor1: W/S or arrows move ±{MOTOR1_MANUAL_STEP_MM:.2f} mm", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                cv2.putText(annotated, f"Motor1 accel: {MOTOR1_ACCEL} (',' slower | '.' faster)", (10, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                cv2.putText(annotated, "Motor2: [ slower | ] faster | 0 stop", (10, 94), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                cv2.putText(annotated, f"Search band: center {search_end - search_start}px", (10, 116), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                cv2.putText(annotated, "View: left half only", (10, 138), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                status_text = "Interface: manually" if interface_fallback else "Interface: detected"
+                status_color = (0, 165, 255) if interface_fallback else (0, 255, 0)
+                cv2.putText(annotated, status_text, (10, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1)
 
-                    cv2.putText(annotated, f"Motor2: {motor2_speed} steps/s", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                    cv2.putText(annotated, f"Motor1: W/S or arrows move ±{MOTOR1_MANUAL_STEP_MM:.2f} mm", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                    cv2.putText(annotated, "Motor2: [ slower | ] faster | 0 stop", (10, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                    cv2.putText(annotated, f"Search band: center {search_end - search_start}px", (10, 94), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-                    cv2.putText(annotated, "View: left half only", (10, 116), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                    status_text = "Interface: manually" if interface_fallback else "Interface: detected"
-                    status_color = (0, 165, 255) if interface_fallback else (0, 255, 0)
-                    cv2.putText(annotated, status_text, (10, 138), cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1)
+                filtered_view = build_interface_filtered_view(
+                    img,
+                    interface_mm=interface_mm,
+                    interface_fallback=interface_fallback,
+                )
 
-                    filtered_view = build_interface_filtered_view(
-                        img,
-                        interface_mm=interface_mm,
-                        interface_fallback=interface_fallback,
-                    )
-
-                    combined_view = np.hstack((annotated, filtered_view))
-                    cv2.imshow("Interface (Live + Filtered)", combined_view)
+                combined_view = np.hstack((annotated, filtered_view))
+                cv2.imshow("Interface (Live + Filtered)", combined_view)
 
             key = cv2.waitKeyEx(1)
             if not args.no_motor and isinstance(motor, ArduinoStepper):
@@ -1193,6 +1383,10 @@ def main():
                     update_motor2_speed(motor, MOTOR2_SPEED + MOTOR2_SPEED_STEP)
                 elif key in (ord('['), ord('-'), ord('_')):
                     update_motor2_speed(motor, max(0, MOTOR2_SPEED - MOTOR2_SPEED_STEP))
+                elif key in (ord('.'), ord('>')):
+                    update_motor1_accel(motor, MOTOR1_ACCEL + MOTOR1_ACCEL_STEP)
+                elif key in (ord(','), ord('<')):
+                    update_motor1_accel(motor, MOTOR1_ACCEL - MOTOR1_ACCEL_STEP)
                 elif key == ord('1'):
                     update_motor2_speed(motor, MOTOR2_SPEED_MIN)
                 elif key == ord('2'):
@@ -1202,13 +1396,17 @@ def main():
                 elif key == ord('0'):
                     update_motor2_speed(motor, 0)
 
-            time.sleep(DISPLAY_INTERVAL)
+            time.sleep(0.005)
     except KeyboardInterrupt:
         if not args.no_motor and isinstance(motor, ArduinoStepper):
             try:
                 motor.stop_motor2()
             except Exception as e:
                 print(f"Warning: failed to stop motor2 cleanly: {e}")
+
+            if motor_worker is not None:
+                motor_worker.stop()
+                motor_worker.join(timeout=1.0)
 
         for thread in threads:
             thread.running = False

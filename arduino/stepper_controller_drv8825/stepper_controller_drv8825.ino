@@ -14,8 +14,17 @@ bool motor2_running = false;
 unsigned long motor2_step_interval_us = 3500;
 unsigned long motor2_last_step_us = 0;
 
-float accel = 2000.0;   // steps/s²
+float accel = 600.0;    // steps/s² (gentler acceleration for motor 1)
 int max_speed = 2000;   // steps/s
+
+float clampAccel(float requested_accel)
+{
+  if(requested_accel < 50.0)
+    return 50.0;
+  if(requested_accel > 5000.0)
+    return 5000.0;
+  return requested_accel;
+}
 
 void stepPulse(unsigned int delay_us)
 {
@@ -30,6 +39,23 @@ void stepPulse2()
   digitalWrite(STEP_PIN2, HIGH);
   delayMicroseconds(2);
   digitalWrite(STEP_PIN2, LOW);
+}
+
+void waitWithMotor2Service(unsigned long wait_us)
+{
+  unsigned long start_us = micros();
+  while((unsigned long)(micros() - start_us) < wait_us)
+  {
+    serviceMotor2();
+  }
+}
+
+void stepPulseMotor1WithService(unsigned int half_delay_us)
+{
+  digitalWrite(STEP_PIN, HIGH);
+  waitWithMotor2Service(half_delay_us);
+  digitalWrite(STEP_PIN, LOW);
+  waitWithMotor2Service(half_delay_us);
 }
 
 void serviceMotor2()
@@ -59,15 +85,20 @@ void moveSteps(long steps, int speed)
   float v = 200.0;
   float delay_us;
 
+  if(speed <= 0)
+    speed = 1;
+
   for(long i=0;i<count;i++)
   {
     if(v < speed)
       v += accel * 0.0005;
 
+    if(v > max_speed)
+      v = max_speed;
+
     delay_us = 1000000.0 / v / 2.0;
 
-    serviceMotor2();
-    stepPulse(delay_us);
+    stepPulseMotor1WithService((unsigned int)delay_us);
 
     if(dir) position_steps++;
     else position_steps--;
@@ -203,6 +234,21 @@ void loop()
     else if(cmd.startsWith("RESET"))
     {
       Serial.println("RESET OK");
+    }
+
+    else if(cmd.startsWith("ACCEL1?"))
+    {
+      Serial.print("ACCEL1 ");
+      Serial.println((int)accel);
+    }
+
+    else if(cmd.startsWith("ACCEL1"))
+    {
+      int requested_accel = (int)accel;
+      sscanf(cmd.c_str(),"ACCEL1 %d",&requested_accel);
+      accel = clampAccel((float)requested_accel);
+      Serial.print("ACCEL1 OK ");
+      Serial.println((int)accel);
     }
 
     else if(cmd.startsWith("ZERO"))
