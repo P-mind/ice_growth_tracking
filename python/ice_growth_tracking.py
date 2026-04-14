@@ -645,7 +645,7 @@ class InterfaceTracker(threading.Thread):
                 continue
 
             # Rotate camera frame 180 degrees for correct orientation
-            frame = cv2.rotate(frame, cv2.ROTATE_180)
+          #  frame = cv2.rotate(frame, cv2.ROTATE_180)
 
             # Use only the left half of the camera frame for tracking and display
           #  frame = frame[:, :max(1, frame.shape[1] // 2)]
