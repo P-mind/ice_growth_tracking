@@ -90,19 +90,19 @@ FLUSH_INTERVAL = 20
 DISPLAY_INTERVAL = 0.5
 PLOT_UPDATE_INTERVAL = 1.0
 
-TARGET_INTERFACE_MM = 0.05  # None keeps the detected interface centered in the frame
+TARGET_INTERFACE_MM = None  # None keeps the detected interface centered in the frame
 INTERFACE_CONF_THRESHOLD = 5.0  # Pixel
 INTERFACE_SEARCH_RANGE_PX = 50  # Restrict detection to a central horizontal band
 
 MAX_TRAVEL_MM = 80      # Prevent motor from moving too far in case of tracking loss
 
 MOTOR2_SPEED_INIT = 200      # Initial speed for the secondary motor in steps/sec
-MOTOR2_SPEED_STEP = 2000   # Live adjustment step for keyboard control
+MOTOR2_SPEED_STEP = 1000   # Live adjustment step for keyboard control
 
 # Predefine minimum, maximum, and default speeds for motor 2 to ensure safe operation
 MOTOR2_SPEED_MAX = 20000
 MOTOR2_SPEED_MIN = 500  
-MOTOR2_SPEED_AVG = 10000
+MOTOR2_SPEED_AVG = 5000
 
 MOTOR1_MANUAL_STEP_MM = 0.25   # Manual nudge per keypress for motor 1
 MOTOR1_MANUAL_SPEED = 400     # Speed for manual motor 1 nudges in steps/sec
