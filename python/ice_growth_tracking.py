@@ -655,6 +655,7 @@ class InterfaceTracker(threading.Thread):
         self.lost_counter = 0
         self.search_step = int(STEPS_PER_MM * 0.1)
         self.last_detected_interface_mm = None
+        self.last_detected_filtered_mm = None
 
     @staticmethod
     def _limited_tracking_steps(error_mm, gain, max_step_per_cycle):
@@ -725,8 +726,8 @@ class InterfaceTracker(threading.Thread):
             # Rotate camera frame 180 degrees for correct orientation
           #  frame = cv2.rotate(frame, cv2.ROTATE_180)
 
-            # Use only the left half of the camera frame for tracking and display
-          #  frame = frame[:, :max(1, frame.shape[1] // 2)]
+            # Use only the middle third of the camera frame for tracking and display
+            frame = frame[:, frame.shape[1] // 3 : 2 * frame.shape[1] // 3]
 
             row,confidence = detect_interface(frame)
             search_start, search_end = get_interface_search_bounds(frame.shape[0])
@@ -734,23 +735,21 @@ class InterfaceTracker(threading.Thread):
             fallback_row = 0.5 * (search_start + search_end - 1)
             fallback_mm = fallback_row * MM_PER_PIXEL
             fallback_used = row is None or confidence < INTERFACE_CONF_THRESHOLD
-
-            if row is not None:
-                # Keep the latest measurable interface position so fallback can hold it.
-                self.last_detected_interface_mm = row * MM_PER_PIXEL
+            fallback_height = None
 
             if fallback_used:
                 self.lost_counter += 1
                 if self.last_detected_interface_mm is not None:
                     interface_mm = self.last_detected_interface_mm
+                    fallback_height = self.last_detected_filtered_mm if self.last_detected_filtered_mm is not None else interface_mm
                     interface_source = "fallback_last_detected"
                 else:
                     interface_mm = fallback_mm
+                    fallback_height = interface_mm
                     interface_source = "fallback_center"
             else:
                 self.lost_counter = 0
                 interface_mm = row * MM_PER_PIXEL
-                self.last_detected_interface_mm = interface_mm
                 interface_source = "detected"
 
             with state.lock:
@@ -759,6 +758,9 @@ class InterfaceTracker(threading.Thread):
             # Normal Tracking Mode
             if not fallback_used:
                 height,velocity = self.kalman.update(interface_mm)
+                # Store the filtered value so fallback stays continuous with displayed detection.
+                self.last_detected_interface_mm = interface_mm
+                self.last_detected_filtered_mm = height
                 future = height + velocity * CAPTURE_INTERVAL
                 error = future - target_interface_mm
                 steps = self._limited_tracking_steps(
@@ -781,12 +783,12 @@ class InterfaceTracker(threading.Thread):
                 )
                 if not manual_override_active and steps != 0:
                     self.move_with_limit(steps, speed=MOTOR1_TRACK_SPEED)
-                height = interface_mm
+                height = fallback_height if fallback_height is not None else interface_mm
             # Long Loss: keep showing the search-band center.
             else:
                 if not manual_override_active:
                     print("Interface lost — using center of search band")
-                height, velocity = interface_mm, 0
+                height, velocity = (fallback_height if fallback_height is not None else interface_mm), 0
 
             motor_pos = self.motor.get_position_mm()
 
