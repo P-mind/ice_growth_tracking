@@ -656,6 +656,8 @@ class InterfaceTracker(threading.Thread):
         self.search_step = int(STEPS_PER_MM * 0.1)
         self.last_detected_interface_mm = None
         self.last_detected_filtered_mm = None
+        self.prev_motor_pos = None
+        self.motor_pos_origin = self.motor.get_position_mm()
 
     @staticmethod
     def _limited_tracking_steps(error_mm, gain, max_step_per_cycle):
@@ -784,13 +786,22 @@ class InterfaceTracker(threading.Thread):
                 if not manual_override_active and steps != 0:
                     self.move_with_limit(steps, speed=MOTOR1_TRACK_SPEED)
                 height = fallback_height if fallback_height is not None else interface_mm
-            # Long Loss: keep showing the search-band center.
+            # Long Loss: reset display to the center of the search band.
             else:
-                if not manual_override_active:
-                    print("Interface lost — using center of search band")
-                height, velocity = (fallback_height if fallback_height is not None else interface_mm), 0
+                # if not manual_override_active:
+                #     print("Interface lost — using center of search band")
+                interface_mm = fallback_mm
+                interface_source = "fallback_center"
+                height, velocity = fallback_mm, 0
 
             motor_pos = self.motor.get_position_mm()
+
+            # Compute growth rate from motor 1 displacement only
+            if self.prev_motor_pos is not None:
+                motor_velocity = (motor_pos - self.prev_motor_pos) / CAPTURE_INTERVAL
+            else:
+                motor_velocity = 0.0
+            self.prev_motor_pos = motor_pos
 
             # Update motor status
             if manual_override_active:
@@ -803,10 +814,10 @@ class InterfaceTracker(threading.Thread):
             with state.lock:
 
                 state.interface_mm=interface_mm
-                state.interface_filtered=height
+                state.interface_filtered=(motor_pos - self.motor_pos_origin) + height
                 state.interface_fallback=fallback_used
                 state.interface_source=interface_source
-                state.growth_rate=velocity*60
+                state.growth_rate=motor_velocity*60
                 state.motor_position_mm=motor_pos
                 state.motor_status=motor_status
                 state.image=frame
