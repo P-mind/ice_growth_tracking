@@ -101,7 +101,7 @@ MOTOR2_SPEED_STEP = 1000   # Live adjustment step for keyboard control
 
 # Predefine minimum, maximum, and default speeds for motor 2 to ensure safe operation
 MOTOR2_SPEED_MAX = 20000
-MOTOR2_SPEED_MIN = 500  
+MOTOR2_SPEED_MIN = 2200  
 MOTOR2_SPEED_AVG = 5000
 
 MOTOR1_MANUAL_STEP_MM = 0.25   # Manual nudge per keypress for motor 1
@@ -728,8 +728,8 @@ class InterfaceTracker(threading.Thread):
             # Rotate camera frame 180 degrees for correct orientation
           #  frame = cv2.rotate(frame, cv2.ROTATE_180)
 
-            # Use only the middle third of the camera frame for tracking and display
-            frame = frame[:, frame.shape[1] // 3 : 2 * frame.shape[1] // 3]
+            # Use only the middle fifth of the camera frame for tracking and display
+            frame = frame[frame.shape[0] // 5 : 4 * frame.shape[0] // 5, 2 * frame.shape[1] // 5 : 3 * frame.shape[1] // 5]
 
             row,confidence = detect_interface(frame)
             search_start, search_end = get_interface_search_bounds(frame.shape[0])
@@ -1369,15 +1369,15 @@ def main():
                     line_color = (0, 165, 255) if interface_fallback else (0, 0, 255)
                     cv2.line(annotated, (0, row), (img_width, row), line_color, 2)
 
-                cv2.putText(annotated, f"Motor2: {motor2_speed} steps/s", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                cv2.putText(annotated, f"Motor1: W/S or arrows move ±{MOTOR1_MANUAL_STEP_MM:.2f} mm", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                cv2.putText(annotated, f"Motor1 accel: {MOTOR1_ACCEL} (',' slower | '.' faster)", (10, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                cv2.putText(annotated, "Motor2: [ slower | ] faster | 0 stop", (10, 94), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                cv2.putText(annotated, f"Search band: center {search_end - search_start}px", (10, 116), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-                cv2.putText(annotated, "View: left half only", (10, 138), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.putText(annotated, f"Motor2: {motor2_speed} steps/s", (10, img_height - 145), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                cv2.putText(annotated, f"Motor1: W/S or arrows move ±{MOTOR1_MANUAL_STEP_MM:.2f} mm", (10, img_height - 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                cv2.putText(annotated, f"Motor1 accel: {MOTOR1_ACCEL} (',' slower | '.' faster)", (10, img_height - 98), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                cv2.putText(annotated, "Motor2: [ slower | ] faster | 0 stop", (10, img_height - 76), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                cv2.putText(annotated, f"Search band: center {search_end - search_start}px", (10, img_height - 54), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                cv2.putText(annotated, "View: left half only", (10, img_height - 32), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                 status_text = "Interface: fallback (last detected)" if interface_fallback else "Interface: detected"
                 status_color = (0, 165, 255) if interface_fallback else (0, 255, 0)
-                cv2.putText(annotated, status_text, (10, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1)
+                cv2.putText(annotated, status_text, (10, img_height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1)
 
                 filtered_view = build_interface_filtered_view(
                     img,
