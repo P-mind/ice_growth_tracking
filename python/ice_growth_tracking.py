@@ -98,7 +98,7 @@ INTERFACE_SEARCH_BAND_WIDTH_PX = 240  # Restrict detection to a central vertical
 MAX_TRAVEL_MM = 80      # Prevent motor from moving too far in case of tracking loss
 
 MOTOR2_SPEED_INIT = 200      # Initial speed for the secondary motor in steps/sec
-MOTOR2_SPEED_STEP = 1000   # Live adjustment step for keyboard control
+MOTOR2_SPEED_STEP = 500   # Live adjustment step for keyboard control
 
 # Predefine minimum, maximum, and default speeds for motor 2 to ensure safe operation
 MOTOR2_SPEED_MAX = 20000
@@ -700,6 +700,7 @@ class InterfaceTracker(threading.Thread):
         self.last_detected_filtered_mm = None
         self.prev_motor_pos = None
         self.motor_pos_origin = self.motor.get_position_mm()
+        self.interface_filtered_origin = None
 
     @staticmethod
     def _limited_tracking_steps(error_mm, gain, max_step_per_cycle):
@@ -855,8 +856,12 @@ class InterfaceTracker(threading.Thread):
 
             with state.lock:
 
+                absolute_interface_mm = (motor_pos - self.motor_pos_origin) + height
+                if self.interface_filtered_origin is None:
+                    self.interface_filtered_origin = absolute_interface_mm
+
                 state.interface_mm=interface_mm
-                state.interface_filtered=(motor_pos - self.motor_pos_origin) + height
+                state.interface_filtered=absolute_interface_mm - self.interface_filtered_origin
                 state.interface_fallback=fallback_used
                 state.interface_source=interface_source
                 state.growth_rate=motor_velocity*60
@@ -1297,7 +1302,7 @@ def main():
         update_motor1_accel(motor, MOTOR1_ACCEL)
         print(f"Motor1 acceleration: {MOTOR1_ACCEL} steps/s^2")
         print(f"Motor2 start: speed={MOTOR2_SPEED} steps/s")
-        print(f"Motor1 controls: 'w'/'s' or up/down arrows move ±{MOTOR1_MANUAL_STEP_MM:.2f} mm")
+        print(f"Motor1 controls: up/down arrows move ±{MOTOR1_MANUAL_STEP_MM:.2f} mm")
         print("Motor1 accel: ',' slower | '.' faster")
         print("Motor2 controls: '[' slower | ']' faster | '0' stop")
         motor.start_motor2(MOTOR2_SPEED)
@@ -1417,7 +1422,7 @@ def main():
                     cv2.line(annotated, (0, row), (img_width, row), line_color, 2)
 
                 cv2.putText(annotated, f"Motor2: {motor2_speed} steps/s", (10, img_height - 145), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                cv2.putText(annotated, f"Motor1: W/S or arrows move ±{MOTOR1_MANUAL_STEP_MM:.2f} mm", (10, img_height - 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                cv2.putText(annotated, f"Motor1: up/down arrows move ±{MOTOR1_MANUAL_STEP_MM:.2f} mm", (10, img_height - 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                 cv2.putText(annotated, f"Motor1 accel: {MOTOR1_ACCEL} (',' slower | '.' faster)", (10, img_height - 98), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                 cv2.putText(annotated, "Motor2: [ slower | ] faster | 0 stop", (10, img_height - 76), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                 cv2.putText(annotated, f"Search band: {search_end - search_start}px x {col_end - col_start}px", (10, img_height - 54), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
@@ -1437,7 +1442,7 @@ def main():
 
             key = cv2.waitKeyEx(1)
 
-            if key in (ord('s'), ord('S')):
+            if key in (ord('t'), ord('T')):
                 register_sample_event()
 
             if not args.no_motor and isinstance(motor, ArduinoStepper):
