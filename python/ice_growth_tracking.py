@@ -93,6 +93,7 @@ PLOT_UPDATE_INTERVAL = 1.0
 TARGET_INTERFACE_MM = None  # None keeps the detected interface centered in the frame
 INTERFACE_CONF_THRESHOLD = 5.0  # Pixel
 INTERFACE_SEARCH_RANGE_PX = 50  # Restrict detection to a central horizontal band
+INTERFACE_SEARCH_BAND_WIDTH_PX = 240  # Restrict detection to a central vertical band
 
 MAX_TRAVEL_MM = 80      # Prevent motor from moving too far in case of tracking loss
 
@@ -140,7 +141,8 @@ CSV_HEADER = [
                 "motor_position_mm",
                 "motor2_speed_steps_s",
                 "interface_source",
-                "motor_status"
+                "motor_status",
+                "took_sample"
             ]
 
 ########################################
@@ -176,10 +178,24 @@ class SystemState:
         self.motor_status = "running"  # "running", "stopped_wall", "lost", "manual", "fallback"
         self.motor2_speed = MOTOR2_SPEED_INIT
         self.manual_override_until = 0.0
+        self.next_sample_id = 1
+        self.pending_sample_ids = deque()
 
         self.image = None
 
 state = SystemState()
+
+
+def register_sample_event():
+    """
+    Queue a sample marker so logger writes an incrementing took_sample value.
+    """
+    with state.lock:
+        sample_id = state.next_sample_id
+        state.next_sample_id += 1
+        state.pending_sample_ids.append(sample_id)
+
+    print(f"Sample marker queued: {sample_id}")
 
 ########################################
 # ARDUINO STEPPER
@@ -442,6 +458,21 @@ def get_interface_search_bounds(frame_height, search_range_px=INTERFACE_SEARCH_R
     return row_start, row_end
 
 
+def get_interface_search_columns(frame_width, search_band_width_px=INTERFACE_SEARCH_BAND_WIDTH_PX):
+    """
+    Return the start/end columns of the central vertical band used for interface detection.
+    """
+    band_width = max(3, min(int(search_band_width_px), int(frame_width)))
+    center_col = int(frame_width) // 2
+    half_band = band_width // 2
+
+    col_start = max(0, center_col - half_band)
+    col_end = min(int(frame_width), col_start + band_width)
+    col_start = max(0, col_end - band_width)
+
+    return col_start, col_end
+
+
 def get_target_interface_mm(frame_height, target_interface_mm=TARGET_INTERFACE_MM):
     """
     Return the target interface position in mm.
@@ -458,7 +489,7 @@ def get_target_interface_mm(frame_height, target_interface_mm=TARGET_INTERFACE_M
 
 def detect_interface(frame):
     """
-    Detect the ice-water interface using only the middle horizontal search band.
+    Detect the ice-water interface using a central search window.
 
     Args:
         frame: Input camera frame (BGR image).
@@ -466,7 +497,7 @@ def detect_interface(frame):
     Returns:
         tuple: (interface_position_pixels, confidence) where interface_position_pixels is the subpixel-accurate
                position in pixels, or None if detection fails, and confidence is based on the gradient peak
-               strength within the center horizontal band.
+               strength within the center search window.
     """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -474,8 +505,13 @@ def detect_interface(frame):
     sobel = cv2.Sobel(blur, cv2.CV_64F, 0, 1, ksize=3)
     gradient = np.abs(sobel)
 
-    row_strength = gradient.mean(axis=1)
     row_start, row_end = get_interface_search_bounds(frame.shape[0])
+    col_start, col_end = get_interface_search_columns(frame.shape[1])
+    search_gradient = gradient[:, col_start:col_end]
+    if search_gradient.shape[1] < 3:
+        return None, 0
+
+    row_strength = search_gradient.mean(axis=1)
     search_strength = row_strength[row_start:row_end]
 
     if len(search_strength) < 3:
@@ -530,8 +566,13 @@ def detect_upper_interface(frame, min_distance=20, height_threshold=0.3):
     sobel = cv2.Sobel(blur, cv2.CV_64F, 0, 1, ksize=3)
     gradient = np.abs(sobel)
     
-    row_strength = gradient.mean(axis=1)
     row_start, row_end = get_interface_search_bounds(frame.shape[0])
+    col_start, col_end = get_interface_search_columns(frame.shape[1])
+    search_gradient = gradient[:, col_start:col_end]
+    if search_gradient.shape[1] < 3:
+        return None, 0
+
+    row_strength = search_gradient.mean(axis=1)
     search_strength = row_strength[row_start:row_end]
 
     if len(search_strength) < 3:
@@ -601,11 +642,12 @@ def build_interface_filtered_view(frame, interface_mm=None, interface_fallback=F
 
     img_height, img_width = filtered_view.shape[:2]
     search_start, search_end = get_interface_search_bounds(img_height)
+    col_start, col_end = get_interface_search_columns(img_width)
 
     overlay = filtered_view.copy()
-    cv2.rectangle(overlay, (0, search_start), (img_width - 1, search_end - 1), (255, 255, 0), -1)
+    cv2.rectangle(overlay, (col_start, search_start), (col_end - 1, search_end - 1), (255, 255, 0), -1)
     cv2.addWeighted(overlay, 0.12, filtered_view, 0.88, 0, filtered_view)
-    cv2.rectangle(filtered_view, (0, search_start), (img_width - 1, search_end - 1), (255, 255, 0), 1)
+    cv2.rectangle(filtered_view, (col_start, search_start), (col_end - 1, search_end - 1), (255, 255, 0), 1)
 
     if interface_mm is not None and interface_mm > 0:
         row = int(round(interface_mm / MM_PER_PIXEL))
@@ -729,7 +771,7 @@ class InterfaceTracker(threading.Thread):
           #  frame = cv2.rotate(frame, cv2.ROTATE_180)
 
             # Use only the middle fifth of the camera frame for tracking and display
-            frame = frame[frame.shape[0] // 5 : 4 * frame.shape[0] // 5, 2 * frame.shape[1] // 5 : 3 * frame.shape[1] // 5]
+        #    frame = frame[frame.shape[0] // 5 : 4 * frame.shape[0] // 5, 2 * frame.shape[1] // 5 : 3 * frame.shape[1] // 5]
 
             row,confidence = detect_interface(frame)
             search_start, search_end = get_interface_search_bounds(frame.shape[0])
@@ -870,6 +912,7 @@ class Logger(threading.Thread):
             time.sleep(LOG_INTERVAL)
 
             with state.lock:
+                took_sample = state.pending_sample_ids.popleft() if state.pending_sample_ids else False
 
                 row=[
                     datetime.now().isoformat(),
@@ -880,7 +923,8 @@ class Logger(threading.Thread):
                     state.motor_position_mm,
                     state.motor2_speed,
                     state.interface_source,
-                    state.motor_status
+                    state.motor_status,
+                    took_sample
                 ]
 
             self.writer.writerow(row)
@@ -1181,7 +1225,7 @@ def main():
     (motor, temperature sensor), starts background threads for tracking, logging, display, and temperature reading. 
     Runs an infinite loop until interrupted, then gracefully stops all threads.
     """
-    global CAPTURE_INTERVAL, DISPLAY_INTERVAL, IMAGE_WIDTH, IMAGE_HEIGHT, MOTOR1_ACCEL, MOTOR2_SPEED
+    global CAPTURE_INTERVAL, DISPLAY_INTERVAL, IMAGE_WIDTH, IMAGE_HEIGHT, MOTOR1_ACCEL, MOTOR2_SPEED, INTERFACE_SEARCH_BAND_WIDTH_PX
 
     parser = argparse.ArgumentParser(description="Ice Growth Tracking System")
     parser.add_argument('--no-motor', action='store_true', help='Disable motor control')
@@ -1194,6 +1238,7 @@ def main():
     parser.add_argument('--image-height', type=int, default=480, help='Camera image height (default: 480)')
     parser.add_argument('--motor1-accel', type=int, default=MOTOR1_ACCEL_INIT, help='Motor 1 acceleration in steps/s^2')
     parser.add_argument('--motor2-speed', type=int, default=MOTOR2_SPEED_INIT, help='Initial speed for the secondary motor in steps/sec')
+    parser.add_argument('--interface-search-width-px', type=int, default=INTERFACE_SEARCH_BAND_WIDTH_PX, help=f'Central vertical search band width in pixels (default: {INTERFACE_SEARCH_BAND_WIDTH_PX})')
     parser.add_argument('--test-arduino', action='store_true', help='Test Arduino serial communication and exit')
 
     args = parser.parse_args()
@@ -1237,6 +1282,7 @@ def main():
     # IMAGE_HEIGHT = args.image_height
     MOTOR1_ACCEL = max(MOTOR1_ACCEL_MIN, min(MOTOR1_ACCEL_MAX, int(MOTOR1_ACCEL_INIT)))
     MOTOR2_SPEED = MOTOR2_SPEED_INIT
+    INTERFACE_SEARCH_BAND_WIDTH_PX = max(3, int(args.interface_search_width_px))
 
     with state.lock:
         state.motor2_speed = MOTOR2_SPEED
@@ -1273,7 +1319,7 @@ def main():
     plt.ion()
     fig, ax = plt.subplots()
     fig2, ax2 = plt.subplots()
-    ax_twin = ax.twinx()
+    # ax_twin = ax.twinx()
     ax2_twin = ax2.twinx()
     last_plot_update = 0.0
 
@@ -1292,7 +1338,7 @@ def main():
 
                 # Update main plot
                 ax.clear()
-                ax_twin.clear()
+                # ax_twin.clear()
                 if time_data:
                     interface_data = plot_data["interface"]
                     fallback_flags = plot_data["interface_fallback"]
@@ -1316,10 +1362,10 @@ def main():
                 ax.set_ylabel('Interface (mm)', color='blue')
                 ax.tick_params(axis='y', labelcolor='blue')
 
-                if time_data:
-                    ax_twin.plot(time_data, plot_data["growth"], label="Growth mm/min", color='red')
-                ax_twin.set_ylabel('Growth Rate (mm/min)', color='red')
-                ax_twin.tick_params(axis='y', labelcolor='red')
+                # if time_data:
+                #     ax_twin.plot(time_data, plot_data["growth"], label="Growth mm/min", color='red')
+                # ax_twin.set_ylabel('Growth Rate (mm/min)', color='red')
+                # ax_twin.tick_params(axis='y', labelcolor='red')
 
                 plt.figure(fig.number)  # Switch to main figure
                 plt.pause(0.01)
@@ -1357,11 +1403,12 @@ def main():
                 annotated = img.copy()
                 img_height, img_width = annotated.shape[:2]
                 search_start, search_end = get_interface_search_bounds(img_height)
+                col_start, col_end = get_interface_search_columns(img_width)
 
                 overlay = annotated.copy()
-                cv2.rectangle(overlay, (0, search_start), (img_width - 1, search_end - 1), (255, 255, 0), -1)
+                cv2.rectangle(overlay, (col_start, search_start), (col_end - 1, search_end - 1), (255, 255, 0), -1)
                 cv2.addWeighted(overlay, 0.12, annotated, 0.88, 0, annotated)
-                cv2.rectangle(annotated, (0, search_start), (img_width - 1, search_end - 1), (255, 255, 0), 1)
+                cv2.rectangle(annotated, (col_start, search_start), (col_end - 1, search_end - 1), (255, 255, 0), 1)
 
                 if interface_mm is not None and interface_mm > 0:
                     row = int(round(interface_mm / MM_PER_PIXEL))
@@ -1373,7 +1420,7 @@ def main():
                 cv2.putText(annotated, f"Motor1: W/S or arrows move ±{MOTOR1_MANUAL_STEP_MM:.2f} mm", (10, img_height - 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                 cv2.putText(annotated, f"Motor1 accel: {MOTOR1_ACCEL} (',' slower | '.' faster)", (10, img_height - 98), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                 cv2.putText(annotated, "Motor2: [ slower | ] faster | 0 stop", (10, img_height - 76), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                cv2.putText(annotated, f"Search band: center {search_end - search_start}px", (10, img_height - 54), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                cv2.putText(annotated, f"Search band: {search_end - search_start}px x {col_end - col_start}px", (10, img_height - 54), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
                 cv2.putText(annotated, "View: left half only", (10, img_height - 32), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                 status_text = "Interface: fallback (last detected)" if interface_fallback else "Interface: detected"
                 status_color = (0, 165, 255) if interface_fallback else (0, 255, 0)
@@ -1389,6 +1436,10 @@ def main():
                 cv2.imshow("Interface (Live + Filtered)", combined_view)
 
             key = cv2.waitKeyEx(1)
+
+            if key in (ord('s'), ord('S')):
+                register_sample_event()
+
             if not args.no_motor and isinstance(motor, ArduinoStepper):
                 motor1_step = max(1, int(round(MOTOR1_MANUAL_STEP_MM * STEPS_PER_MM)))
 
