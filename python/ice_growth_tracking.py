@@ -109,6 +109,10 @@ MOTOR2_SPEED_AVG = 5000
 MOTOR1_MANUAL_STEP_MM = 0.25   # Manual nudge per keypress for motor 1
 MOTOR1_MANUAL_SPEED = 400     # Speed for manual motor 1 nudges in steps/sec
 MOTOR1_TRACK_SPEED = 120      # Slower speed for automatic tracking moves in steps/sec
+
+EMERGENCY_LIFT_MM = 150.0       # Upward retract distance when emergency key ('e') is pressed
+EMERGENCY_LIFT_SPEED = 4000     # Faster speed for emergency upward retract (steps/sec)
+
 MOTOR1_TRACK_GAIN = 0.2       # Position correction gain for automatic tracking
 MOTOR1_LOST_GAIN = 0.1        # Smaller gain while running on prediction fallback
 MOTOR1_MAX_STEP_PER_CYCLE = 12  # Limit tracking correction per capture cycle (steps)
@@ -1242,6 +1246,29 @@ def update_motor1_accel(motor, new_accel):
     MOTOR1_ACCEL = new_accel
     print(f"Motor1 acceleration updated to {MOTOR1_ACCEL} steps/s^2")
 
+
+def emergency_stop_and_retract(motor, motor_worker=None, lift_mm=EMERGENCY_LIFT_MM):
+    """
+    Stop continuous motion and lift motor1 upward by a fixed distance.
+    """
+    if not isinstance(motor, ArduinoStepper):
+        return
+
+    try:
+        motor.stop_motor2()
+        print("Emergency stop: motor2 stopped")
+    except Exception as e:
+        print(f"Warning: emergency stop could not stop motor2: {e}")
+
+    lift_steps = max(1, int(round(abs(lift_mm) * STEPS_PER_MM)))
+    print(f"Emergency retract: moving motor1 up by {abs(lift_mm):.2f} mm at {EMERGENCY_LIFT_SPEED} steps/s")
+    move_motor1_manual(
+        motor,
+        lift_steps,
+        speed=EMERGENCY_LIFT_SPEED,
+        motor_worker=motor_worker,
+    )
+
 ########################################
 # MAIN
 ########################################
@@ -1327,6 +1354,7 @@ def main():
         print(f"Motor1 controls: up/down arrows move ±{MOTOR1_MANUAL_STEP_MM:.2f} mm")
         print("Motor1 accel: ',' slower | '.' faster")
         print("Motor2 controls: '[' slower | ']' faster | '0' stop")
+        print(f"Emergency: 'e' stops + lifts motor1 by {EMERGENCY_LIFT_MM:.2f} mm")
         motor.start_motor2(MOTOR2_SPEED)
 
     tracker = InterfaceTracker(motor, motor_worker=motor_worker)
@@ -1447,8 +1475,8 @@ def main():
                 cv2.putText(annotated, f"Motor1: up/down arrows move ±{MOTOR1_MANUAL_STEP_MM:.2f} mm", (10, img_height - 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                 cv2.putText(annotated, f"Motor1 accel: {MOTOR1_ACCEL} (',' slower | '.' faster)", (10, img_height - 98), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                 cv2.putText(annotated, "Motor2: [ slower | ] faster | 0 stop", (10, img_height - 76), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                cv2.putText(annotated, f"Search band: {search_end - search_start}px x {col_end - col_start}px", (10, img_height - 54), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-                cv2.putText(annotated, "View: left half only", (10, img_height - 32), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.putText(annotated, f"Emergency 'e': stop + lift {EMERGENCY_LIFT_MM:.2f} mm", (10, img_height - 54), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+                cv2.putText(annotated, f"Search band: {search_end - search_start}px x {col_end - col_start}px", (10, img_height - 32), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
                 status_text = "Interface: fallback (last detected)" if interface_fallback else "Interface: detected"
                 status_color = (0, 165, 255) if interface_fallback else (0, 255, 0)
                 cv2.putText(annotated, status_text, (10, img_height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1)
@@ -1490,6 +1518,9 @@ def main():
                     update_motor2_speed(motor, MOTOR2_SPEED_AVG)
                 elif key == ord('0'):
                     update_motor2_speed(motor, 0)
+                elif key in (ord('e'), ord('E')):
+                    emergency_stop_and_retract(motor, motor_worker=motor_worker, lift_mm=EMERGENCY_LIFT_MM)
+                    raise KeyboardInterrupt
 
             time.sleep(0.005)
     except KeyboardInterrupt:
