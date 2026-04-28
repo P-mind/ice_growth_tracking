@@ -95,7 +95,8 @@ INTERFACE_CONF_THRESHOLD = 5.0  # Pixel
 INTERFACE_SEARCH_RANGE_PX = 50  # Restrict detection to a central horizontal band
 INTERFACE_SEARCH_BAND_WIDTH_PX = 240  # Restrict detection to a central vertical band
 
-MAX_TRAVEL_MM = 80      # Prevent motor from moving too far in case of tracking loss
+MAX_TRAVEL_MM = 100      # Upper travel limit relative to zero position
+MIN_TRAVEL_MM = -80     # Lower travel limit relative to zero position
 
 MOTOR2_SPEED_INIT = 200      # Initial speed for the secondary motor in steps/sec
 MOTOR2_SPEED_STEP = 500   # Live adjustment step for keyboard control
@@ -734,7 +735,7 @@ class InterfaceTracker(threading.Thread):
             max_allowed_steps = int(remaining_mm * STEPS_PER_MM)
             limited_steps = min(steps, max_allowed_steps)
         else:
-            available_mm = max(0.0, current_pos_mm)
+            available_mm = current_pos_mm - MIN_TRAVEL_MM
             if available_mm <= 0:
                 return
             max_allowed_steps = int(available_mm * STEPS_PER_MM)
@@ -1095,6 +1096,14 @@ class MotorMoveWorker(threading.Thread):
             self.pending_command = (int(steps), int(speed))
             self.new_command.set()
 
+    def clear_pending(self):
+        """
+        Drop any queued automatic move so manual control has immediate priority.
+        """
+        with self.command_lock:
+            self.pending_command = None
+            self.new_command.clear()
+
     @staticmethod
     def _apply_travel_limit(current_pos_mm, steps):
         if steps == 0:
@@ -1107,7 +1116,7 @@ class MotorMoveWorker(threading.Thread):
             max_allowed_steps = int(remaining_mm * STEPS_PER_MM)
             return min(steps, max_allowed_steps)
 
-        available_mm = max(0.0, current_pos_mm)
+        available_mm = current_pos_mm - MIN_TRAVEL_MM
         if available_mm <= 0:
             return 0
         max_allowed_steps = int(available_mm * STEPS_PER_MM)
@@ -1148,32 +1157,45 @@ class MotorMoveWorker(threading.Thread):
                 print(f"Warning: failed to move motor1: {e}")
 
 
-def move_motor1_manual(motor, requested_steps, speed=MOTOR1_MANUAL_SPEED):
+def move_motor1_manual(motor, requested_steps, speed=MOTOR1_MANUAL_SPEED, motor_worker=None):
     """
-    Manually nudge the primary motor from the keyboard without applying travel limits.
+    Manually nudge the primary motor from the keyboard.
+
+    Uses the same travel-limit logic as automatic tracking to keep distance handling
+    consistent between manual and automatic movement paths.
     """
     if not isinstance(motor, ArduinoStepper) or requested_steps == 0:
         return
 
     manual_steps = int(requested_steps)
 
+    # Prevent a stale queued tracking command from executing around a manual nudge.
+    if motor_worker is not None:
+        motor_worker.clear_pending()
+
+    current_pos_mm = motor.get_position_mm()
+    limited_steps = MotorMoveWorker._apply_travel_limit(current_pos_mm, manual_steps)
+    if limited_steps == 0:
+        print("Motor1 manual move blocked by travel limit")
+        return
+
     with state.lock:
         state.manual_override_until = time.time() + MANUAL_OVERRIDE_DURATION
 
     try:
-        motor.move_steps(manual_steps, speed=speed)
+        motor.move_steps(limited_steps, speed=speed)
     except Exception as e:
         print(f"Warning: failed to move motor1: {e}")
         return
 
     new_pos_mm = motor.get_position_mm()
-    direction = "up" if manual_steps > 0 else "down"
+    direction = "up" if limited_steps > 0 else "down"
 
     with state.lock:
         state.motor_position_mm = new_pos_mm
         state.motor_status = "manual"
 
-    print(f"Motor1 moved {direction}: {manual_steps} steps ({new_pos_mm:.2f} mm)")
+    print(f"Motor1 moved {direction}: {limited_steps} steps ({new_pos_mm:.2f} mm)")
 
 
 def update_motor2_speed(motor, new_speed):
@@ -1449,9 +1471,9 @@ def main():
                 motor1_step = max(1, int(round(MOTOR1_MANUAL_STEP_MM * STEPS_PER_MM)))
 
                 if key in (ord('w'), ord('W'), 82, 2490368, 65362):
-                    move_motor1_manual(motor, motor1_step)
+                    move_motor1_manual(motor, motor1_step, motor_worker=motor_worker)
                 elif key in (ord('s'), ord('S'), 84, 2621440, 65364):
-                    move_motor1_manual(motor, -motor1_step)
+                    move_motor1_manual(motor, -motor1_step, motor_worker=motor_worker)
                 elif key in (ord(']'), ord('='), ord('+')):
                     update_motor2_speed(motor, MOTOR2_SPEED + MOTOR2_SPEED_STEP)
                 elif key in (ord('['), ord('-'), ord('_')):
