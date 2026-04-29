@@ -93,7 +93,7 @@ PLOT_UPDATE_INTERVAL = 1.0
 TARGET_INTERFACE_MM = None  # None keeps the detected interface centered in the frame
 INTERFACE_CONF_THRESHOLD = 5.0  # Pixel
 INTERFACE_SEARCH_RANGE_PX = 50  # Restrict detection to a central horizontal band
-INTERFACE_SEARCH_BAND_WIDTH_PX = 240  # Restrict detection to a central vertical band
+INTERFACE_SEARCH_BAND_WIDTH_PX = 50  # Restrict detection to a central vertical band
 
 MAX_TRAVEL_MM = 100      # Upper travel limit relative to zero position
 MIN_TRAVEL_MM = -80     # Lower travel limit relative to zero position
@@ -147,7 +147,8 @@ CSV_HEADER = [
                 "motor2_speed_steps_s",
                 "interface_source",
                 "motor_status",
-                "took_sample"
+                "took_sample",
+                "took_picture"
             ]
 
 ########################################
@@ -185,6 +186,7 @@ class SystemState:
         self.manual_override_until = 0.0
         self.next_sample_id = 1
         self.pending_sample_ids = deque()
+        self.pending_picture = False
 
         self.image = None
 
@@ -201,6 +203,14 @@ def register_sample_event():
         state.pending_sample_ids.append(sample_id)
 
     print(f"Sample marker queued: {sample_id}")
+
+
+def register_picture_event():
+    """
+    Signal logger to write True in the took_picture column for the next CSV row.
+    """
+    with state.lock:
+        state.pending_picture = True
 
 ########################################
 # ARDUINO STEPPER
@@ -630,7 +640,7 @@ def detect_upper_interface(frame, min_distance=20, height_threshold=0.3):
     return upper_interface[0], upper_interface[1]
 
 
-def build_interface_filtered_view(frame, interface_mm=None, interface_fallback=False):
+def build_interface_filtered_view(frame, interface_mm=None, interface_fallback=False, interface_filtered=None):
     """
     Build a visualization of the filtered image used for interface extraction.
 
@@ -661,6 +671,36 @@ def build_interface_filtered_view(frame, interface_mm=None, interface_fallback=F
         cv2.line(filtered_view, (0, row), (img_width - 1, row), line_color, 2)
 
     cv2.putText(filtered_view, "Filtered: Sobel |dI/dy|", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+    if interface_filtered is not None:
+        iface_label = f"Interface: {interface_filtered:.3f} mm" + (" (fallback)" if interface_fallback else "")
+        iface_color = (0, 165, 255) if interface_fallback else (0, 255, 0)
+        cv2.putText(filtered_view, iface_label, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3)
+        cv2.putText(filtered_view, iface_label, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55, iface_color, 1)
+    elif interface_mm is not None and interface_mm > 0:
+        iface_label = f"Interface: {interface_mm:.3f} mm" + (" (fallback)" if interface_fallback else "")
+        iface_color = (0, 165, 255) if interface_fallback else (0, 255, 0)
+        cv2.putText(filtered_view, iface_label, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3)
+        cv2.putText(filtered_view, iface_label, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55, iface_color, 1)
+
+    # Keyboard help overlay at the bottom of the filtered view
+    key_hints = [
+        ("W/S or Up/Down", "Move motor1 up/down", (0, 255, 255)),
+        ("] / [", "Motor2 faster / slower", (0, 255, 255)),
+        (". / ,", "Motor1 accel faster / slower", (0, 255, 255)),
+        ("1 / 2 / 3 / 0", "Motor2: min/max/avg/stop", (0, 255, 255)),
+        ("T", "Register sample event", (180, 255, 100)),
+        ("P", "Save plots + snapshot", (180, 255, 100)),
+        ("E", "Emergency stop + lift", (0, 80, 255)),
+    ]
+    line_h = 18
+    y_start = img_height - len(key_hints) * line_h - 4
+    for i, (key_label, desc, color) in enumerate(key_hints):
+        y = y_start + i * line_h
+        cv2.putText(filtered_view, f"{key_label}: {desc}", (6, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 0, 0), 2)
+        cv2.putText(filtered_view, f"{key_label}: {desc}", (6, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1)
+
     return filtered_view
 
 ########################################
@@ -923,6 +963,8 @@ class Logger(threading.Thread):
 
             with state.lock:
                 took_sample = state.pending_sample_ids.popleft() if state.pending_sample_ids else False
+                took_picture = state.pending_picture
+                state.pending_picture = False
 
                 row=[
                     datetime.now().isoformat(),
@@ -934,7 +976,8 @@ class Logger(threading.Thread):
                     state.motor2_speed,
                     state.interface_source,
                     state.motor_status,
-                    took_sample
+                    took_sample,
+                    took_picture
                 ]
 
             self.writer.writerow(row)
@@ -1377,6 +1420,14 @@ def main():
     # ax_twin = ax.twinx()
     ax2_twin = ax2.twinx()
     last_plot_update = 0.0
+    last_combined_view = None
+
+    # Prepare plots output folder consistent with the CSV filename (./data/plots/experiment_TIMESTAMP/)
+    plot_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    plot_dir = os.path.join(".", "data", "plots", f"experiment_{plot_timestamp}")
+    os.makedirs(plot_dir, exist_ok=True)
+    plot_interface_path = os.path.join(plot_dir, "interface.png")
+    plot_temperature_path = os.path.join(plot_dir, "temperature.png")
 
     for thread in threads:
         thread.start()
@@ -1424,6 +1475,7 @@ def main():
 
                 plt.figure(fig.number)  # Switch to main figure
                 plt.pause(0.01)
+                fig.savefig(plot_interface_path)
 
                 # Update temperature plot
                 ax2.clear()
@@ -1446,11 +1498,13 @@ def main():
 
                 plt.figure(fig2.number)  # Switch to temperature figure
                 plt.pause(0.01)
+                fig2.savefig(plot_temperature_path)
 
             # Keep camera display responsive even when plot updates are throttled.
             with state.lock:
                 img = state.image
                 interface_mm = state.interface_mm
+                interface_filtered = state.interface_filtered
                 interface_fallback = state.interface_fallback
                 motor2_speed = state.motor2_speed
 
@@ -1485,15 +1539,27 @@ def main():
                     img,
                     interface_mm=interface_mm,
                     interface_fallback=interface_fallback,
+                    interface_filtered=interface_filtered,
                 )
 
                 combined_view = np.hstack((annotated, filtered_view))
+                last_combined_view = combined_view
                 cv2.imshow("Interface (Live + Filtered)", combined_view)
 
             key = cv2.waitKeyEx(1)
 
             if key in (ord('t'), ord('T')):
                 register_sample_event()
+
+            if key in (ord('p'), ord('P')):
+                pic_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                fig.savefig(os.path.join(plot_dir, f"interface_{pic_ts}.png"))
+                fig2.savefig(os.path.join(plot_dir, f"temperature_{pic_ts}.png"))
+                with state.lock:
+                    if last_combined_view is not None:
+                        cv2.imwrite(os.path.join(plot_dir, f"camera_{pic_ts}.png"), last_combined_view)
+                register_picture_event()
+                print(f"Plots saved: interface_{pic_ts}.png / temperature_{pic_ts}.png / camera_{pic_ts}.png")
 
             if not args.no_motor and isinstance(motor, ArduinoStepper):
                 motor1_step = max(1, int(round(MOTOR1_MANUAL_STEP_MM * STEPS_PER_MM)))
