@@ -92,7 +92,7 @@ PLOT_UPDATE_INTERVAL = 1.0
 
 TARGET_INTERFACE_MM = None  # None keeps the detected interface centered in the frame
 INTERFACE_CONF_THRESHOLD = 5.0  # Pixel
-INTERFACE_SEARCH_RANGE_PX = 50  # Restrict detection to a central horizontal band
+INTERFACE_SEARCH_RANGE_PX = 30  # Restrict detection to a central horizontal band
 INTERFACE_SEARCH_BAND_WIDTH_PX = 50  # Restrict detection to a central vertical band
 
 MAX_TRAVEL_MM = 100      # Upper travel limit relative to zero position
@@ -103,15 +103,15 @@ MOTOR2_SPEED_STEP = 500   # Live adjustment step for keyboard control
 
 # Predefine minimum, maximum, and default speeds for motor 2 to ensure safe operation
 MOTOR2_SPEED_MAX = 20000
-MOTOR2_SPEED_MIN = 2200  
-MOTOR2_SPEED_AVG = 5000
+MOTOR2_SPEED_MIN = 500  
+MOTOR2_SPEED_AVG = 3000
 
 MOTOR1_MANUAL_STEP_MM = 0.25   # Manual nudge per keypress for motor 1
 MOTOR1_MANUAL_SPEED = 400     # Speed for manual motor 1 nudges in steps/sec
 MOTOR1_TRACK_SPEED = 120      # Slower speed for automatic tracking moves in steps/sec
 
-EMERGENCY_LIFT_MM = 150.0       # Upward retract distance when emergency key ('e') is pressed
-EMERGENCY_LIFT_SPEED = 4000     # Faster speed for emergency upward retract (steps/sec)
+EMERGENCY_LIFT_MM = 250.0       # Upward retract distance when emergency key ('e') is pressed
+EMERGENCY_LIFT_SPEED = 5000     # Faster speed for emergency upward retract (steps/sec)
 
 MOTOR1_TRACK_GAIN = 0.2       # Position correction gain for automatic tracking
 MOTOR1_LOST_GAIN = 0.1        # Smaller gain while running on prediction fallback
