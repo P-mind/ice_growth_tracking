@@ -1,7 +1,5 @@
 __pycache__/
 *.pyc
-*.csv
-*.log
 .ipynb_checkpoints
 .DS_Store
 .vscode
