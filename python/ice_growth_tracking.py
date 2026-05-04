@@ -110,7 +110,7 @@ MOTOR1_MANUAL_STEP_MM = 0.25   # Manual nudge per keypress for motor 1
 MOTOR1_MANUAL_SPEED = 400     # Speed for manual motor 1 nudges in steps/sec
 MOTOR1_TRACK_SPEED = 120      # Slower speed for automatic tracking moves in steps/sec
 
-EMERGENCY_LIFT_MM = 250.0       # Upward retract distance when emergency key ('e') is pressed
+EMERGENCY_LIFT_MM = 500.0       # Upward retract distance when emergency key ('e') is pressed
 EMERGENCY_LIFT_SPEED = 5000     # Faster speed for emergency upward retract (steps/sec)
 
 MOTOR1_TRACK_GAIN = 0.2       # Position correction gain for automatic tracking
